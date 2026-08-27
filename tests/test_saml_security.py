@@ -23,10 +23,16 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import NameOID
-from lxml import etree
 
-from maop.enterprise.saml_handler import SAMLHandler
-from maop.enterprise.sso import SSOConfig, SSOError, SSOProvider
+# sso-saml extra（lxml/defusedxml）未安装时整模块跳过而非收集报错；
+# CI 已安装该 extra（见 .github/workflows/ci.yml），正常环境会执行。
+pytest.importorskip("lxml", reason="requires sso-saml extra")
+pytest.importorskip("defusedxml", reason="requires sso-saml extra")
+
+from lxml import etree  # noqa: E402
+
+from maop.enterprise.saml_handler import SAMLHandler  # noqa: E402
+from maop.enterprise.sso import SSOConfig, SSOError, SSOProvider  # noqa: E402
 
 SAMLP_NS = "urn:oasis:names:tc:SAML:2.0:protocol"
 SAML_NS = "urn:oasis:names:tc:SAML:2.0:assertion"
