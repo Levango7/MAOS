@@ -10,6 +10,22 @@
 
 ---
 
+## 整改跟踪（2026-08-28 更新，v5.2.0）
+
+本审计报告中提出的部分建议已在 v5.2.0 落地，状态更新如下：
+
+| 审计项 | 原状态 | 现状（2026-08-28） |
+|---|---|---|
+| 硬件指纹字段仅解析不校验（7.1 表） | ⚠️ 仅字段支持 | ✅ **已强制执行**（P0 #8）：`validate(key, expected_fingerprint=...)` 比对失败即拒绝；`enforce_max_users` / `feature_allowed` 供业务层消费 |
+| 模块完整性校验为死代码，无调用点 | ⚠️ 已实现未接通 | ✅ **已接通启动路径**（P0 #7）：`maop.enterprise` 导入时执行 `verify_module_integrity()`；生产环境失败抛 `ModuleTamperError` 阻断；新增签名工具 `scripts/sign_enterprise_modules.py` |
+| CRL 自身签名缺失（3.5 / 7.2.5） | ⚠️ 建议项 | ✅ **客户端验证已实现**（P1 #17）：带 `signature` 字段的 CRL 用打包 Ed25519 公钥验签，失败拒绝缓存与使用；无签名的旧格式 CRL 仍接受（记录 WARNING，向后兼容）。**服务端签名仍需部署方配合** |
+| CRL 仅按 customer 字符串吊销 | ⚠️ 粒度不足 | ✅ **已支持 `license_id` 精确吊销**（P1 #17）：条目含 `license_id` 时精确匹配，否则回退 customer 匹配 |
+| 测试密钥与生产密钥隔离（8.3 项 1） | ⚠️ 仅 .gitignore | ✅ **已加固**（P1 #15/#16）：`LicenseManager` 无签名私钥拒绝构造（不再自动生成临时密钥对）；`issue_test_license.py` 在 `MAOP_ENV=production` 时拒绝用测试密钥签发 |
+
+**仍未解决项**（维持原报告结论）：6.1 公钥替换攻击面、6.3 时钟回拨、PyArmor 混淆（7.2.1）、在线激活（7.2.3）、密钥轮换（7.2.4）。
+
+---
+
 ## 第1章 签名验证机制
 
 ### 1.1 算法强度
@@ -135,6 +151,7 @@ validate() → _check_revocation() → CRLChecker.check_license()
 
 - **回滚攻击**：攻击者保留旧版有效 CRL 缓存（未含撤销条目），断网时降级使用。`_load_cached_crl_raw` 仅按 mtime 判断新鲜度，未对 CRL 自身签名验证。
 - **建议**：CRL 服务端应对 CRL JSON 做 Ed25519 签名，客户端用同一公钥验签，防止缓存被注入伪造撤销列表。
+- **整改状态（2026-08-28）**：客户端验签已实现（P1 #17，`_verify_crl_signature`）——拉取到的 CRL 若带 `signature` 字段则验签，失败即拒绝（不缓存、不使用）。**残余窗口**：本地缓存文件本身仍可被回滚为旧版有效 CRL（mtime 检查可被同时篡改），且旧格式无签名 CRL 仍被接受；彻底收敛需服务端强制签名 + 严格模式。
 
 ---
 
@@ -276,7 +293,7 @@ validate() → _check_revocation() → CRLChecker.check_license()
 | CRL 缓存 + 离线降级 | ✅ 已实现 | `crl.py` 第 161-258 行 |
 | 模块完整性校验 | ✅ 已实现 | `license.py` 第 377-508 行 |
 | 无 license → PERSONAL 降级 | ✅ 已实现 | docstring 第 24-30 行 |
-| 硬件指纹绑定字段 | ✅ 已支持 | `LicenseInfo.fingerprint` 字段 |
+| 硬件指纹绑定字段 | ✅ 已强制执行（2026-08-28） | `validate(expected_fingerprint=...)` + `compute_machine_fingerprint`（P0 #8） |
 | 生产级签发 CLI | ✅ 已实现 | `scripts/issue_license.py` |
 
 ### 7.2 建议增强项
@@ -310,11 +327,12 @@ validate() → _check_revocation() → CRLChecker.check_license()
   - CRL 同时支持多 key 撤销
 - **收益**：单 key 泄露不影响其他 key 签发的 license
 
-#### 7.2.5 CRL 自身签名（优先级：中）
+#### 7.2.5 CRL 自身签名（优先级：中）——✅ 客户端验证已实现（2026-08-28，P1 #17）
 
 - **目标**：防 CRL 缓存被注入伪造撤销列表 / 缓存回滚
 - **方案**：CRL JSON 增加 `signature` 字段，服务端用同一 Ed25519 私钥签名，客户端验签
 - **收益**：即使攻击者写入伪造 `data/crl_cache.json`，验签失败被拒绝
+- **现状**：客户端 `_verify_crl_signature` 已实现（签名对象为去除 `signature` 字段的规范化 JSON，base64url 编码，用打包公钥验证）。待办：CRL 服务端上线签名 + 停止接受无签名 CRL
 
 #### 7.2.6 License Payload 加密（优先级：低）
 
