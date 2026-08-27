@@ -11,10 +11,10 @@ import pytest
 
 @pytest.fixture
 def rbac(enterprise_edition):
-    """A fresh ``RBACManager`` instance (no PG persistence in tests)."""
+    """A fresh ``RBACManager`` instance (no persistence in tests)."""
     from maop.enterprise.rbac import RBACManager
 
-    return RBACManager()
+    return RBACManager(enable_sqlite_fallback=False)
 
 
 # ── Role / Permission enums ─────────────────────────────────────────
@@ -101,8 +101,7 @@ def test_superadmin_has_all_permissions(rbac):
 
 
 def test_require_permission_raises_when_missing(rbac):
-    from maop.enterprise.rbac import Permission, Role
-    from maop.enterprise.rbac import PermissionDenied
+    from maop.enterprise.rbac import Permission, PermissionDenied, Role
 
     rbac.grant_role("viewer1", Role.VIEWER)
     with pytest.raises(PermissionDenied):

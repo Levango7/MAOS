@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ── Happy path ──────────────────────────────────────────────────────
 
 def test_license_validates(validator, license_key):
