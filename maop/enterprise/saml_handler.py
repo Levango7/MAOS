@@ -13,8 +13,8 @@
   - **InResponseTo 校验**：验证 Response 的 InResponseTo 与 SP 发出的
     AuthnRequest ID 匹配，防止 replay。
   - **defusedxml**：XML 解析使用 defusedxml（审计过的库）防 XXE。
-  - **xmlsec**：若安装了 xmlsec 库，优先使用其审计过的签名验证；
-    否则回退到自研验证（保持兼容性）。
+  - **xmlsec**：当前未集成 xmlsec 库；签名验证使用自研 RSA-SHA256 实现。
+    _HAS_XMLSEC 标志保留供未来集成使用。
 
 设计原则：fail-closed —— 任何验证失败均抛 SSOError，绝不返回 stub session。
 """
@@ -95,6 +95,8 @@ class SAMLHandler:
         self._pending_request_ids: set[str] = set()
         # G-11: 标记是否已发出 xmlsec 缺失警告（仅首次 handle_response 调用时发一次）
         self._xmlsec_warning_emitted: bool = False
+        # P0: Assertion replay prevention — consumed assertion IDs with timestamps
+        self._consumed_assertion_ids: dict[str, float] = {}
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
@@ -162,6 +164,20 @@ class SAMLHandler:
         if not root.tag == f"{{{_SAMLP_NS}}}Response":
             raise SSOError(f"Expected samlp:Response root, got {root.tag}")
 
+        # Verify Response Status
+        status_elem = root.find(f"{{{_SAMLP_NS}}}Status")
+        if status_elem is not None:
+            status_code_elem = status_elem.find(f"{{{_SAMLP_NS}}}StatusCode")
+            if status_code_elem is not None:
+                status_value = status_code_elem.get("Value", "")
+                if status_value and status_value != "urn:oasis:names:tc:SAML:2.0:status:Success":
+                    status_msg_elem = status_elem.find(f"{{{_SAMLP_NS}}}StatusMessage")
+                    msg = status_msg_elem.text if status_msg_elem is not None and status_msg_elem.text else ""
+                    raise SSOError(
+                        f"SAML Response status is not Success: {status_value}"
+                        + (f" — {msg}" if msg else "")
+                    )
+
         # G-06: InResponseTo 校验 — 防止 replay 攻击
         in_response_to = root.get("InResponseTo", "")
         if in_response_to:
@@ -180,6 +196,16 @@ class SAMLHandler:
             assertion_elem = root.find(f".//{{{_SAML_NS}}}Assertion")
         if assertion_elem is None:
             raise SSOError("SAMLResponse missing <saml:Assertion> element")
+
+        # P0: Assertion replay prevention — lazy cleanup + check
+        now_ts = time.time()
+        self._consumed_assertion_ids = {
+            aid: ts for aid, ts in self._consumed_assertion_ids.items()
+            if now_ts - ts < _DEFAULT_SESSION_TTL_S
+        }
+        assertion_id = assertion_elem.get("ID", "")
+        if assertion_id and assertion_id in self._consumed_assertion_ids:
+            raise SSOError(f"Assertion replay detected: ID={assertion_id!r}")
 
         # 4. 获取 IdP 证书
         cert_b64 = self._get_idp_cert_b64()
@@ -211,6 +237,9 @@ class SAMLHandler:
                 # 使用直接子元素，而不是深度查找的元素
                 assertion_elem = direct_assertion
 
+        # P0: Validate SubjectConfirmation (Recipient + NotOnOrAfter)
+        self._validate_subject_confirmation(assertion_elem)
+
         # 6. 验证 Conditions
         expected_audience = self._config.saml_entity_id or "maop-sp"
         self._validate_conditions(assertion_elem, expected_audience)
@@ -218,6 +247,10 @@ class SAMLHandler:
         # 7. 提取 NameID 和 Attributes
         name_id = self._extract_name_id(assertion_elem)
         attributes = self._extract_attributes(assertion_elem)
+
+        # P0: Record consumed assertion ID after all validations pass
+        if assertion_id:
+            self._consumed_assertion_ids[assertion_id] = time.time()
 
         # 8. 构造 SSOUser 和 SSOSession
         now = time.time()
@@ -430,7 +463,8 @@ class SAMLHandler:
         (XSW防护).
 
         G-11 fix: uses defusedxml for XML parsing (audited library).
-        If xmlsec is available, delegates to it for signature verification.
+        NOTE: xmlsec integration is not yet implemented; always uses self-verified
+        RSA-SHA256 regardless of _HAS_XMLSEC flag.
 
         验证步骤：
           1. 解析证书为公钥对象
@@ -591,14 +625,49 @@ class SAMLHandler:
         return attributes
 
     def _extract_name_id(self, assertion_elem) -> str:
-        """提取 NameID（Subject > NameID）。"""
+        """Extract NameID (Subject > NameID). Raises SSOError if missing (fail-closed)."""
         subject = assertion_elem.find(f"{{{_SAML_NS}}}Subject")
         if subject is None:
-            return ""
+            raise SSOError("SAML Assertion missing <saml:Subject> element")
         name_id_elem = subject.find(f"{{{_SAML_NS}}}NameID")
-        if name_id_elem is None or not name_id_elem.text:
-            return ""
-        return name_id_elem.text  # type: ignore
+        if name_id_elem is None or not (name_id_elem.text or "").strip():
+            raise SSOError("SAML Assertion missing <saml:NameID> in Subject")
+        return name_id_elem.text.strip()  # type: ignore
+
+    def _validate_subject_confirmation(self, assertion_elem) -> None:
+        """Verify SubjectConfirmation Data: Recipient matches ACS URL, NotOnOrAfter not expired."""
+        subject = assertion_elem.find(f"{{{_SAML_NS}}}Subject")
+        if subject is None:
+            return  # Subject is optional per SAML spec; NameID check handles identity
+        sc = subject.find(f"{{{_SAML_NS}}}SubjectConfirmation")
+        if sc is None:
+            return  # SubjectConfirmation is optional
+        sc_data = sc.find(f"{{{_SAML_NS}}}SubjectConfirmationData")
+        if sc_data is None:
+            return
+
+        # Check Recipient matches our ACS URL
+        recipient = sc_data.get("Recipient", "")
+        expected_acs = self._config.saml_acs_url or self._config.redirect_uri
+        if recipient and expected_acs and recipient != expected_acs:
+            raise SSOError(
+                f"SubjectConfirmation Recipient mismatch: "
+                f"expected {expected_acs!r}, got {recipient!r}"
+            )
+
+        # Check NotOnOrAfter
+        noa_str = sc_data.get("NotOnOrAfter")
+        if noa_str:
+            try:
+                noa = _parse_saml_time(noa_str)
+            except Exception as exc:
+                raise SSOError(f"Failed to parse SubjectConfirmationData NotOnOrAfter: {exc}") from exc
+            now = datetime.datetime.now(datetime.timezone.utc)
+            skew = datetime.timedelta(seconds=self._clock_skew_s)
+            if now - skew >= noa:
+                raise SSOError(
+                    f"SubjectConfirmationData NotOnOrAfter {noa_str} has passed"
+                )
 
     def _validate_conditions(self, assertion_elem, expected_audience: str) -> None:
         """验证 Conditions：Audience、NotBefore、NotOnOrAfter。
@@ -607,8 +676,7 @@ class SAMLHandler:
         """
         conditions = assertion_elem.find(f"{{{_SAML_NS}}}Conditions")
         if conditions is None:
-            # 没有 Conditions 也算通过（某些 IdP 不下发 Conditions）
-            return
+            raise SSOError("SAML Assertion missing required <saml:Conditions> element")
 
         now = datetime.datetime.now(datetime.timezone.utc)
         skew = datetime.timedelta(seconds=self._clock_skew_s)
@@ -641,16 +709,17 @@ class SAMLHandler:
 
         # AudienceRestriction
         audience_restriction = conditions.find(f"{{{_SAML_NS}}}AudienceRestriction")
-        if audience_restriction is not None:
-            audiences = audience_restriction.findall(f"{{{_SAML_NS}}}Audience")
-            if not audiences:
-                raise SSOError("AudienceRestriction has no Audience element")
-            audience_values = [a.text or "" for a in audiences]
-            if expected_audience not in audience_values:
-                raise SSOError(
-                    f"Audience mismatch: expected {expected_audience!r}, "
-                    f"got {audience_values}"
-                )
+        if audience_restriction is None:
+            raise SSOError("SAML Assertion missing required <saml:AudienceRestriction>")
+        audiences = audience_restriction.findall(f"{{{_SAML_NS}}}Audience")
+        if not audiences:
+            raise SSOError("AudienceRestriction has no Audience element")
+        audience_values = [a.text or "" for a in audiences]
+        if expected_audience not in audience_values:
+            raise SSOError(
+                f"Audience mismatch: expected {expected_audience!r}, "
+                f"got {audience_values}"
+            )
 
     def _get_not_on_or_after(self, assertion_elem) -> datetime.datetime | None:
         """从 Conditions 提取 NotOnOrAfter（用于 session 过期时间）。"""

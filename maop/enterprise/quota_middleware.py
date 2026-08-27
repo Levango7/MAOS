@@ -35,13 +35,17 @@ logger = logging.getLogger(__name__)
 
 #: 每条规则: (compiled_pattern, resource_name). 匹配按顺序,首条命中即用.
 #: 资源名与 :mod:`maop.enterprise.quota` 的 KNOWN_RESOURCES 对齐.
+#:
+#: P0 fix: concurrent_tasks 规则必须先于 api_calls —— 旧顺序中
+#: ``/api/agents/{id}/(run|execute|invoke)`` 被更宽的 api_calls 规则
+#: (含 chat|complete) 抢先命中,导致 concurrent_tasks 规则永远不生效.
 _DEFAULT_PATH_PATTERNS: list[tuple[str, str]] = [
-    # 智能体执行/调用 → api_calls
+    # 任务并发 → concurrent_tasks（先匹配,避免被 api_calls 遮蔽）
+    (r"^/api/agents/[^/]+/(run|execute|invoke)$", "concurrent_tasks"),
+    # 智能体执行/调用 → api_calls（chat/complete 等其余调用）
     (r"^/api/agents/[^/]+/(run|execute|invoke|chat|complete)$", "api_calls"),
     (r"^/api/control/(run|execute|invoke)$", "api_calls"),
     (r"^/api/chat/(send|message)$", "api_calls"),
-    # 任务并发 → concurrent_tasks
-    (r"^/api/agents/[^/]+/(run|execute|invoke)$", "concurrent_tasks"),
     # 智能体注册 → agents
     (r"^/api/agents/(register|create)$", "agents"),
     # 数据写入 → storage_mb (粗粒度,按请求计)

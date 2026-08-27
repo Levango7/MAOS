@@ -13,8 +13,16 @@ Validation logic:
     1. Parse the key into payload + signature
     2. Verify the Ed25519 signature against the bundled public key
     3. Check that expires_at has not passed
-    4. Optionally check machine fingerprint if present in the license
+    4. Machine fingerprint binding is ENFORCED when present in the license
+       (fail-closed: a bound license on the wrong machine is rejected;
+       legacy licenses without a fingerprint field skip this check)
     5. Check CRL (Certificate Revocation List) if MAOP_CRL_URL is configured
+
+Limits enforcement (P0 #8 fix):
+    ``max_users`` / ``features`` are parsed into :class:`LicenseInfo` and
+    enforced via :func:`enforce_max_users` / :func:`feature_allowed`.
+    Business layers (RBAC / quota / edition gates) must call these helpers;
+    the validator itself does not know current user counts.
 
 CRL (在线撤销) 支持:
     当设置了 MAOP_CRL_URL 环境变量时，LicenseValidator 会初始化
@@ -52,10 +60,15 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LicenseError",
     "LicenseExpiredError",
+    "LicenseFingerprintError",
     "LicenseFormatError",
     "LicenseInfo",
+    "LicenseLimitError",
     "LicenseSignatureError",
     "LicenseValidator",
+    "compute_machine_fingerprint",
+    "enforce_max_users",
+    "feature_allowed",
 ]
 
 # Grace period after expiry before hard degradation (days)
@@ -75,6 +88,11 @@ class LicenseInfo(BaseModel):
     max_users: int | None = Field(default=None, description="Max concurrent users (None = unlimited)")
     fingerprint: str | None = Field(default=None, description="Optional machine fingerprint binding")
     features: list[str] | None = Field(default=None, description="Optional feature scope")
+    license_id: str = Field(
+        default="",
+        description="Optional unique license ID (P1 #17) — CRL 吊销的精确匹配键，"
+        "缺失时 CRL 回退按 customer 匹配（向后兼容）",
+    )
 
     @property
     def is_expired(self) -> bool:
@@ -110,6 +128,83 @@ class LicenseExpiredError(LicenseError):
             f"License for '{info.customer}' expired on {info.expires_at.isoformat()} "
             f"(grace period of {_GRACE_PERIOD_DAYS} days has passed)"
         )
+
+
+class LicenseFingerprintError(LicenseError):
+    """Machine fingerprint binding check failed (license bound to another machine)."""
+
+
+class LicenseLimitError(LicenseError):
+    """A license limit (e.g. max_users) or feature scope was exceeded."""
+
+
+def compute_machine_fingerprint() -> str:
+    """计算本机指纹（SHA-256 hex），用于 license 机器绑定校验。
+
+    组成：OS 机器 ID（Windows ``MachineGuid`` / Linux ``/etc/machine-id``）
+    + ``platform.system()`` + ``platform.machine()``。无机器 ID 时回退到
+    hostname。同一台机器上结果稳定；重装系统/更换硬件会改变指纹。
+    """
+    import hashlib
+    import platform
+    import socket
+
+    machine_id = ""
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography"
+            ) as hk:
+                machine_id = str(winreg.QueryValueEx(hk, "MachineGuid")[0])
+        except Exception:
+            machine_id = ""
+    else:
+        for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                machine_id = Path(p).read_text(encoding="utf-8").strip()
+                if machine_id:
+                    break
+            except Exception as exc:
+                logger.debug("[license] cannot read %s: %s", p, exc)
+    if not machine_id:
+        machine_id = socket.gethostname()
+    raw = f"{machine_id}|{platform.system()}|{platform.machine()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def enforce_max_users(info: LicenseInfo, current_concurrent_users: int) -> None:
+    """业务层强制 max_users 限制（P0 #8）。
+
+    Parameters
+    ----------
+    info : LicenseInfo
+        验证通过的 license 信息。
+    current_concurrent_users : int
+        当前并发用户数（由调用方统计，如活跃 session 数）。
+
+    Raises
+    ------
+    LicenseLimitError
+        当前用户数超过 license 的 max_users（``max_users=None`` 表示不限制）。
+    """
+    if info.max_users is not None and current_concurrent_users > info.max_users:
+        raise LicenseLimitError(
+            f"License for '{info.customer}' allows at most {info.max_users} "
+            f"concurrent users, but {current_concurrent_users} are active"
+        )
+
+
+def feature_allowed(info: LicenseInfo, feature: str) -> bool:
+    """检查 license 功能范围是否包含指定 feature（P0 #8）。
+
+    ``features=None`` 表示不限制（全功能）；否则 feature 必须在列表内。
+    业务层（RBAC/quota/edition gate）在启用企业特性前调用本函数。
+    """
+    if info.features is None:
+        return True
+    return feature in info.features
 
 
 # L21/L22 (Phase R6): License 在线撤销（CRL）机制已实现。
@@ -185,13 +280,23 @@ class LicenseValidator:
             logger.warning("[license] Failed to init CRL checker: %s", exc)
             return None
 
-    def validate(self, license_key: str) -> LicenseInfo:
+    def validate(
+        self,
+        license_key: str,
+        *,
+        expected_fingerprint: str | None = None,
+    ) -> LicenseInfo:
         """Validate a license key and return its info.
 
         Parameters
         ----------
         license_key : str
             The license key string (format: MAOP-ENT-{payload}.{signature})
+        expected_fingerprint : str | None
+            机器指纹比对值（P0 #8）。license payload 含 ``fingerprint``
+            字段时强制校验（fail-closed）：优先与本参数比对，未提供时
+            用 :func:`compute_machine_fingerprint` 计算本机指纹比对。
+            license 无 ``fingerprint`` 字段（旧版 license）时跳过。
 
         Returns
         -------
@@ -206,6 +311,9 @@ class LicenseValidator:
             If the signature verification fails (tampered or wrong signing key).
         LicenseExpiredError
             If the license has expired beyond the grace period.
+        LicenseFingerprintError
+            If the license is bound to a machine fingerprint that does not
+            match this machine (or ``expected_fingerprint``).
         LicenseRevokedError
             If the license has been revoked via CRL (only when MAOP_CRL_URL
             is configured).
@@ -217,7 +325,27 @@ class LicenseValidator:
         info = self._parse_payload(payload)
         self._check_expiry(info)
         self._check_revocation(info)
+        self._check_fingerprint(info, expected_fingerprint)
         return info
+
+    @staticmethod
+    def _check_fingerprint(
+        info: LicenseInfo, expected_fingerprint: str | None = None
+    ) -> None:
+        """强制机器指纹绑定（fail-closed，P0 #8）。
+
+        license 未携带 fingerprint 字段时跳过（兼容旧版 license）；
+        携带时与 expected_fingerprint（或本机计算值）比对，不一致即拒绝。
+        """
+        if not info.fingerprint:
+            return
+        actual = expected_fingerprint or compute_machine_fingerprint()
+        if actual != info.fingerprint:
+            raise LicenseFingerprintError(
+                f"License for '{info.customer}' is bound to machine fingerprint "
+                f"{info.fingerprint[:12]}… but this machine presents {actual[:12]}… "
+                f"(license cannot be copied to another machine)"
+            )
 
     def validate_from_env(self) -> LicenseInfo | None:
         """Load and validate license from environment or file.

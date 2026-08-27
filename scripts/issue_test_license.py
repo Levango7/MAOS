@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,7 @@ def issue_license(
     days: int = 365,
     max_users: int | None = None,
     features: list[str] | None = None,
+    fingerprint: str | None = None,
 ) -> str:
     """Issue a test license key.
 
@@ -48,6 +50,8 @@ def issue_license(
         Optional max concurrent users limit.
     features : list[str] | None
         Optional feature scope list.
+    fingerprint : str | None
+        Optional machine fingerprint to bind the license to one machine.
 
     Returns
     -------
@@ -58,7 +62,7 @@ def issue_license(
     key_data = private_key_path.read_bytes()
     private_key = serialization.load_pem_private_key(key_data, password=None)
     if not isinstance(private_key, Ed25519PrivateKey):
-        raise ValueError(
+        raise TypeError(
             f"Expected an Ed25519 private key, got {type(private_key).__name__}"
         )
 
@@ -74,6 +78,8 @@ def issue_license(
         payload["max_users"] = max_users
     if features is not None:
         payload["features"] = features
+    if fingerprint:
+        payload["fingerprint"] = fingerprint
 
     # Sign — compact JSON (separators match LicenseValidator parsing)
     payload_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -98,12 +104,23 @@ def main() -> None:
         help="Feature scope (space-separated list)",
     )
     parser.add_argument(
+        "--fingerprint",
+        default=None,
+        help="Bind license to a machine fingerprint "
+        "(use 'auto' to compute this machine's fingerprint)",
+    )
+    parser.add_argument(
         "--write", action="store_true", help="Write to data/test_license.key"
     )
     parser.add_argument(
         "--key",
         default="scripts/test_signing_key.pem",
         help="Private key path (relative to repo root)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow running with the test key even when MAOP_ENV=production",
     )
     args = parser.parse_args()
 
@@ -113,8 +130,34 @@ def main() -> None:
         print(f"ERROR: private key not found at {key_path}", file=sys.stderr)
         sys.exit(1)
 
+    # P1 #16: 防止测试密钥被误用于生产签发。默认 --key 指向测试密钥，
+    # 与打包公钥配对、仅用于测试；生产 license 必须由商务团队用离线
+    # 生产私钥签发。MAOP_ENV=production 时默认拒绝执行。
+    if args.key == "scripts/test_signing_key.pem":
+        print(
+            "WARNING: signing with the TEST key — licenses produced here "
+            "are for testing only and must never ship to production.",
+            file=sys.stderr,
+        )
+        if os.getenv("MAOP_ENV", "").strip().lower() == "production" and not args.force:
+            print(
+                "ERROR: MAOP_ENV=production — refusing to issue a license with "
+                "the test key. Use the production signing process, or pass "
+                "--force to override (not recommended).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    fingerprint = args.fingerprint
+    if fingerprint == "auto":
+        from maop.enterprise.license import compute_machine_fingerprint
+
+        fingerprint = compute_machine_fingerprint()
+        print(f"Using machine fingerprint: {fingerprint}", file=sys.stderr)
+
     license_key = issue_license(
-        key_path, args.customer, args.days, args.max_users, args.features
+        key_path, args.customer, args.days, args.max_users, args.features,
+        fingerprint=fingerprint,
     )
 
     if args.write:

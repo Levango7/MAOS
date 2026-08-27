@@ -90,7 +90,11 @@ class SSOProviderRegistry:
     :class:`SSOManager`，并提供 PKCE state 暂存、连接测试等能力。
     """
 
-    def __init__(self, store: SSOProviderStore | None = None) -> None:
+    def __init__(
+        self,
+        store: SSOProviderStore | None = None,
+        pending_store: Any = None,
+    ) -> None:
         require_feature(FeatureFlag.SSO)
         self._store = store or SSOProviderStore()
         # provider_id → SSOManager 缓存
@@ -101,6 +105,12 @@ class SSOProviderRegistry:
         self._pending: dict[str, tuple[int, str, float]] = {}
         # state TTL（秒）
         self._state_ttl = 600.0
+        # P1 #13: 可选 SQLite 持久化（显式传入或 MAOP_SSO_SESSION_PERSIST 启用），
+        # 解决进程重启后 OIDC 回调 state mismatch 问题
+        if pending_store is None:
+            from maop.enterprise.sso_session_store import maybe_open_store
+            pending_store = maybe_open_store()
+        self._pending_store = pending_store
 
     @property
     def store(self) -> SSOProviderStore:
@@ -206,6 +216,14 @@ class SSOProviderRegistry:
 
         url = mgr.get_authorize_url(state=state, code_challenge=code_challenge)
         self._pending[state] = (provider_id, code_verifier, time.time())
+        # P1 #13: 持久化 state（重启后回调仍可匹配）
+        if self._pending_store is not None:
+            try:
+                self._pending_store.save_pending(
+                    state, provider_id, code_verifier, time.time()
+                )
+            except Exception as exc:
+                logger.warning("[sso_registry] pending persist failed: %s", exc)
         self._gc_pending()
         return url, state
 
@@ -221,21 +239,30 @@ class SSOProviderRegistry:
         调用 :meth:`SSOManager.handle_callback`。
 
         Raises:
-            ValueError: state 不匹配 / 已过期 / code 为空。
+            ValueError: state 缺失 / 不匹配 / 已过期 / code 为空。
             KeyError: provider_id 不存在。
         """
         if not code:
             raise ValueError("Missing authorization code")
+        # P0 fix: state 为必填（fail-closed 防 CSRF）——空 state 直接拒绝，
+        # 不再跳过校验（旧实现 `if state:` 允许无 state 回调绕过 CSRF 防护）
+        if not state:
+            raise ValueError("Missing state parameter (required for CSRF protection)")
         code_verifier = ""
-        if state:
-            pending = self._pending.pop(state, None)
-            if pending is None:
-                raise ValueError(f"SSO state mismatch or expired: {state!r}")
-            pid, code_verifier, _ = pending
-            if pid != provider_id:
-                raise ValueError(
-                    f"SSO state provider mismatch: expected {pid}, got {provider_id}"
-                )
+        pending = self._pending.pop(state, None)
+        if pending is None and self._pending_store is not None:
+            # P1 #13: 内存未命中（如进程重启后）→ 尝试持久化后端
+            try:
+                pending = self._pending_store.pop_pending(state)
+            except Exception as exc:
+                logger.warning("[sso_registry] pending store lookup failed: %s", exc)
+        if pending is None:
+            raise ValueError(f"SSO state mismatch or expired: {state!r}")
+        pid, code_verifier, _ = pending
+        if pid != provider_id:
+            raise ValueError(
+                f"SSO state provider mismatch: expected {pid}, got {provider_id}"
+            )
         mgr = self._get_manager(provider_id)
         if mgr is None:
             raise KeyError(f"SSO provider id={provider_id} not found")
@@ -429,6 +456,11 @@ class SSOProviderRegistry:
         expired = [s for s, (_, _, t) in self._pending.items() if now - t > self._state_ttl]
         for s in expired:
             self._pending.pop(s, None)
+        if self._pending_store is not None:
+            try:
+                self._pending_store.gc_pending(self._state_ttl)
+            except Exception as exc:
+                logger.warning("[sso_registry] pending store GC failed: %s", exc)
 
 
 __all__ = [

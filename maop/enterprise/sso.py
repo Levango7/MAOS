@@ -125,12 +125,26 @@ def _get_saml_handler():
 
 
 class SSOManager:
-    """Enterprise SSO integration manager."""
+    """Enterprise SSO integration manager.
 
-    def __init__(self, config: SSOConfig | None = None) -> None:
+    会话持久化（P1 #13）：默认内存存储（向后兼容）；传入
+    ``session_store`` 或设置 ``MAOP_SSO_SESSION_PERSIST=1`` 时启用
+    SQLite 持久化，进程重启不再丢失已登录会话。
+    """
+
+    def __init__(
+        self,
+        config: SSOConfig | None = None,
+        session_store: Any = None,
+    ) -> None:
         require_feature(FeatureFlag.SSO)
         self._config = config or SSOConfig()
         self._sessions: dict[str, SSOSession] = {}
+        # P1 #13: 可选 SQLite 会话持久化（显式传入或环境变量启用）
+        if session_store is None:
+            from maop.enterprise.sso_session_store import maybe_open_store
+            session_store = maybe_open_store()
+        self._session_store = session_store
 
     @property
     def config(self) -> SSOConfig:
@@ -168,7 +182,9 @@ class SSOManager:
             if code_challenge:
                 params["code_challenge"] = code_challenge
                 params["code_challenge_method"] = "S256"
-            query = "&".join(f"{k}={v}" for k, v in params.items())
+            # P0 fix: 使用 urlencode 正确转义特殊字符（scope 含空格、
+            # redirect_uri 含 &/? 等场景下手动 join 会破坏 URL）
+            query = urllib.parse.urlencode(params)
             return f"{self._config.authorize_url}?{query}"
         return ""
 
@@ -249,11 +265,34 @@ class SSOManager:
             created_at=now,
         )
         self._sessions[session_id] = session
+        self._persist_session(session)
         logger.info(
             "[sso] OIDC session=%s user=%s expires_in=%ss",
             session_id, user.external_id, int(expires_in),
         )
         return session
+
+    def _persist_session(self, session: SSOSession) -> None:
+        """写入会话持久化后端（若启用）。失败仅告警，不阻断登录。"""
+        if self._session_store is None:
+            return
+        try:
+            self._session_store.save_session(
+                session.model_dump_json(),
+                session.session_id,
+                session.expires_at,
+                session.created_at,
+            )
+        except Exception as exc:
+            logger.warning("[sso] session persist failed (in-memory only): %s", exc)
+
+    def _delete_persisted_session(self, session_id: str) -> None:
+        if self._session_store is None:
+            return
+        try:
+            self._session_store.delete_session(session_id)
+        except Exception as exc:
+            logger.warning("[sso] session delete failed: %s", exc)
 
     def _exchange_code(
         self,
@@ -354,19 +393,24 @@ class SSOManager:
         按映射从 claims 取值；否则使用默认 precedence（向后兼容）。
 
         Claim precedence (first non-empty wins, 默认无映射时):
-          - external_id: ``sub`` | ``user_id`` | first 16 chars of id_token
+          - external_id: ``sub`` | ``user_id``（缺失时为 "unknown"；
+            不再从 id_token 截取——id_token 未验签，不可作为身份依据）
           - email: ``email`` | ``email_verified`` (bool -> "")
           - display_name: ``name`` | ``preferred_username`` | ``nickname``
           - roles: ``roles`` (list) | ``role`` (str|list) | ``groups``
           - tenant_id: ``tenant_id`` | ``tid``
+
+        SECURITY NOTE: id_token signature is NOT verified (no JWKS fetch).
+        Identity relies on the userinfo endpoint over TLS + access_token.
+        TODO: add JWKS-based id_token signature verification.
         """
         now = time.time()
         mapping = self._config.attribute_mapping or {}
 
         if mapping:
             sub = self._claim_first(claims, mapping.get("external_id", "sub")) or ""
-            if not sub and token_resp.get("id_token"):
-                sub = str(token_resp["id_token"])[:16]
+            # P0 fix: 不再从 id_token 截取 sub（id_token 未验签，其头部内容
+            # 不可作为用户标识；缺失时统一降级为 "unknown"）
             if not sub:
                 sub = "unknown"
             email = self._claim_first(claims, mapping.get("email", "email"))
@@ -391,8 +435,7 @@ class SSOManager:
             or claims.get("user_id")
             or ""
         )
-        if not sub and token_resp.get("id_token"):
-            sub = str(token_resp["id_token"])[:16]
+        # P0 fix: 不再从 id_token 截取 sub（未验签的 JWT 不可作为身份依据）
         if not sub:
             sub = "unknown"
 
@@ -488,6 +531,7 @@ class SSOManager:
         handler = SAMLHandler(self._config)
         session = handler.handle_response(code, relay_state=state)
         self._sessions[session.session_id] = session
+        self._persist_session(session)
         logger.info(
             "[sso] SAML session=%s user=%s",
             session.session_id, session.user.external_id,
@@ -496,15 +540,33 @@ class SSOManager:
 
     def validate_session(self, session_id: str) -> SSOSession | None:
         session = self._sessions.get(session_id)
+        if session is None and self._session_store is not None:
+            # P1 #13: 内存未命中 → 尝试持久化后端（重启后恢复会话）
+            try:
+                raw = self._session_store.get_session_json(session_id)
+                if raw:
+                    session = SSOSession.model_validate_json(raw)
+                    self._sessions[session_id] = session
+            except Exception as exc:
+                logger.warning("[sso] session load from store failed: %s", exc)
         if not session:
             return None
         if session.expires_at and time.time() > session.expires_at:
             del self._sessions[session_id]
+            self._delete_persisted_session(session_id)
             return None
         return session
 
     def logout(self, session_id: str) -> bool:
-        if session_id in self._sessions:
+        found = session_id in self._sessions
+        if found:
             del self._sessions[session_id]
-            return True
-        return False
+        # P1 #13: 同时处理持久化会话（即使内存中没有也要清后端）
+        if self._session_store is not None:
+            try:
+                if self._session_store.get_session_json(session_id) is not None:
+                    found = True
+                self._session_store.delete_session(session_id)
+            except Exception as exc:
+                logger.warning("[sso] session store logout failed: %s", exc)
+        return found
