@@ -1,7 +1,8 @@
 """MAOP Enterprise Extension Package.
 
 授权模型（2026-08-11 防破解加固):
-  - 本包随 ``maop`` 主包一同发布（单发行 wheel),不再作为独立 wheel.
+  - 本包作为独立的 ``maop-enterprise`` wheel 发布（双 wheel 模式,ADR-018).
+  - 主包 ``maop`` 通过延迟导入 ``maop.enterprise.*`` 使用企业功能,未安装时优雅降级.
   - 包被 importable **不等于** enterprise 激活——必须提供有效 license key.
   - 真正的 edition 决策完全在 :func:`maop.config.edition.detect_edition`,
     它会调用 ``maop.enterprise.license.LicenseValidator`` 验证

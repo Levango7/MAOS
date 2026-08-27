@@ -10,3 +10,17 @@ build/
 .mypy_cache/
 .ruff_cache/
 .venv/
+
+# Signing keys — NEVER commit private keys (test or production)
+# Test signing key (used by issue_test_license.py / issue_license.py default)
+scripts/test_signing_key.pem
+# Any PEM keys generated under scripts/ or data/ (e.g. via --gen-keys)
+scripts/*.pem
+data/*.pem
+# License key files (issued licenses, not source code)
+data/test_license.key
+data/license.key
+# CRL cache (runtime artifact)
+data/crl_cache.json
+# Runtime logs
+data/*.log

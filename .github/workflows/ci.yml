@@ -1,0 +1,96 @@
+# ─────────────────────────────────────────────────────────────────────
+# MAOS (maop-enterprise) — CI Pipeline
+#
+# Tests the enterprise extension package against the MAOP main package.
+# Python 3.10–3.13 matrix (3.14 excluded due to pyyaml 6.0.2 compat).
+# ─────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel superseded runs to save runner time.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default token.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install maop-enterprise in editable mode (pulls in dev deps).
+          pip install -e ".[dev]"
+          # Install maop main package from PyPI (provides maop.config, maop.core).
+          pip install "maop>=5.1.0,<6.0.0"
+
+      - name: Issue test license
+        run: |
+          python scripts/issue_test_license.py --write --customer "Test Enterprise" --days 365
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short
+        env:
+          MAOP_SKIP_INTEGRITY: "1"
+          MAOP_ENV: "test"
+          MAOP_LICENSE_KEY: ${{ secrets.MAOP_TEST_LICENSE_KEY }}
+
+      - name: Lint
+        run: |
+          ruff check maop/ tests/
+
+  # ── Coverage gate ────────────────────────────────────────────────
+  coverage:
+    name: Coverage (≥70%)
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install "maop>=5.1.0,<6.0.0"
+          pip install pytest-cov
+
+      - name: Issue test license
+        run: |
+          python scripts/issue_test_license.py --write --customer "Test Enterprise" --days 365
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ --cov=maop.enterprise --cov-report=term-missing --cov-fail-under=70
+        env:
+          MAOP_SKIP_INTEGRITY: "1"
+          MAOP_ENV: "test"
