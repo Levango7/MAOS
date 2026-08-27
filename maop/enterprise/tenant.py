@@ -59,6 +59,13 @@ class TenantUsage(BaseModel):
     active_users: int = 0
 
 
+#: update_tenant 允许修改的字段（P1 #23）。tenant_id/created_at/updated_at
+#: 是身份与审计字段，禁止通过 update_tenant 覆写。
+_UPDATABLE_TENANT_FIELDS: frozenset[str] = frozenset(
+    {"name", "status", "plan", "quota", "expires_at", "metadata"}
+)
+
+
 class TenantManager:
     """Enterprise multi-tenant lifecycle manager with optional PG persistence."""
 
@@ -131,9 +138,15 @@ class TenantManager:
         tenant = self._tenants.get(tenant_id)
         if not tenant:
             raise KeyError(f"Tenant '{tenant_id}' not found")
+        # P1 #23 fix: 字段白名单 —— 旧实现 hasattr/setattr 允许覆写
+        # tenant_id/created_at 等身份与审计字段（调用方传什么改什么）。
         for k, v in kwargs.items():
-            if hasattr(tenant, k):
+            if k in _UPDATABLE_TENANT_FIELDS:
                 setattr(tenant, k, v)
+            else:
+                logger.warning(
+                    "[tenant] update_tenant: ignoring non-updatable field %r", k
+                )
         tenant.updated_at = time.time()
         if self._pg:
             self._pg.save_tenant(tenant.model_dump())

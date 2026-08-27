@@ -9,12 +9,25 @@ CRL JSON 格式:
       "expires_at": "2026-07-27T11:00:00Z",
       "revoked": [
         {
-          "customer": "Acme Corp",
+          "license_id": "5f2a…（精确吊销键，P1 #17）",
+          "customer": "Acme Corp（向后兼容键）",
           "revoked_at": "2026-07-25T14:30:00Z",
           "reason": "non-payment"
         }
-      ]
+      ],
+      "signature": "base64url(Ed25519(canonical_json_without_signature))"
     }
+
+CRL 签名（P1 #17）:
+    ``signature`` 为对去除 signature 字段后的 CRL 做规范化 JSON
+    （sort_keys + 紧凑分隔符）的 Ed25519 签名（base64url），用打包的
+    license 公钥验证。带 signature 的 CRL 验签失败即拒绝（不缓存、
+    不使用）；无 signature 的旧格式 CRL 仍接受但记录 WARNING
+    （兼容过渡期，建议 CRL 服务尽快启用签名）。
+
+吊销匹配（P1 #17）:
+    优先按 ``license_id`` 精确匹配（唯一标识，不受客户改名影响）；
+    license 或 CRL 条目缺少 license_id 时回退按 ``customer`` 匹配。
 
 环境变量:
     MAOP_CRL_URL            CRL 服务 URL（设置后启用 CRL 检查）
@@ -33,13 +46,14 @@ CRL JSON 格式:
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import time
 import urllib.request
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from maop.enterprise.license import LicenseError
 
@@ -99,10 +113,18 @@ class CRLChecker:
         """
         # crl_url: 显式参数优先，否则读环境变量
         self.crl_url: str = crl_url or os.getenv("MAOP_CRL_URL", "").strip()
-        # cache_path: 默认 data/crl_cache.json
-        self.cache_path: Path = (
-            cache_path if cache_path is not None else Path("data/crl_cache.json")
-        )
+        # cache_path: 默认缓存路径（P1 #17：锚定到绝对路径，避免受进程
+        # cwd 影响导致缓存写到不可预期位置/读不到旧缓存）
+        if cache_path is not None:
+            self.cache_path: Path = cache_path
+        else:
+            base = (
+                os.getenv("MAOP_DATA_DIR")
+                or os.getenv("MAOP_ROOT_DIR")
+                or os.getenv("MAOP_ROOT")
+                or os.getcwd()
+            )
+            self.cache_path = Path(base) / "data" / "crl_cache.json"
         # cache_ttl_s: 环境变量优先（便于运维调参），否则用参数
         env_ttl = os.getenv("MAOP_CRL_CACHE_TTL_S")
         if env_ttl:
@@ -122,8 +144,12 @@ class CRLChecker:
         else:
             self.strict = strict
 
-    def is_revoked(self, customer: str) -> tuple[bool, str]:
+    def is_revoked(self, customer: str, license_id: str = "") -> tuple[bool, str]:
         """检查 license 是否被撤销。
+
+        Args:
+            customer: license 客户名（向后兼容匹配键）。
+            license_id: license 唯一 ID（P1 #17，优先精确匹配键）。
 
         Returns:
             (is_revoked, reason): 如果被撤销返回 (True, reason)，否则 (False, "")
@@ -131,14 +157,16 @@ class CRLChecker:
         Raises:
             CRLError: 严格模式下无法获取 CRL 时抛出
         """
-        entry = self._find_revocation(customer)
+        entry = self._find_revocation(customer, license_id)
         if entry is not None:
             return (True, entry.get("reason", ""))
         return (False, "")
 
-    def _find_revocation(self, customer: str) -> dict | None:
-        """查找 customer 的撤销条目。找不到返回 None。
+    def _find_revocation(self, customer: str, license_id: str = "") -> dict | None:
+        """查找撤销条目。找不到返回 None。
 
+        P1 #17: 优先按 license_id 精确匹配（客户改名不影响吊销）；
+        任一侧缺少 license_id 时回退按 customer 匹配（向后兼容）。
         严格模式下无法获取 CRL 时抛 CRLError。
         """
         crl = self._get_crl()
@@ -154,6 +182,11 @@ class CRLChecker:
         for entry in crl.get("revoked", []):
             if not isinstance(entry, dict):
                 continue
+            entry_license_id = str(entry.get("license_id", "") or "")
+            if license_id and entry_license_id:
+                if entry_license_id == license_id:
+                    return entry
+                continue  # 双方都有 license_id 但不匹配 → 不按 customer 兜底
             if entry.get("customer") == customer:
                 return entry
         return None
@@ -190,6 +223,20 @@ class CRLChecker:
             if not self._validate_crl(data):
                 logger.warning("[crl] Fetched CRL has invalid structure")
                 return None
+            # P1 #17: CRL 签名验证 —— 带签名的 CRL 验签失败即拒绝
+            # （不缓存、不使用），防止中间人篡改撤销列表
+            sig_state = self._verify_crl_signature(data)
+            if sig_state is False:
+                logger.error(
+                    "[crl] Fetched CRL signature verification FAILED — "
+                    "rejecting CRL (possible tampering)"
+                )
+                return None
+            if sig_state is None:
+                logger.warning(
+                    "[crl] Fetched CRL is UNSIGNED — accepting for backward "
+                    "compatibility, but the CRL service should add a signature"
+                )
             self._save_cache(data)
             revoked_count = len(data.get("revoked", []))
             logger.debug(
@@ -283,6 +330,46 @@ class CRLChecker:
         revoked = data.get("revoked")
         return isinstance(revoked, list)
 
+    @staticmethod
+    def _verify_crl_signature(data: dict[str, Any]) -> bool | None:
+        """验证 CRL 的 Ed25519 签名（P1 #17）。
+
+        签名对象：去除 ``signature`` 字段后的 CRL，做规范化 JSON
+        （sort_keys + 紧凑分隔符）；签名值 base64url 编码。公钥使用
+        打包的 license 公钥（与 license 签名同一密钥体系）。
+
+        Returns:
+            True  — 签名有效；
+            False — 签名无效（调用方必须拒绝该 CRL）；
+            None  — CRL 无 signature 字段（旧格式，调用方记录警告）。
+        """
+        sig_b64 = data.get("signature")
+        if not sig_b64 or not isinstance(sig_b64, str):
+            return None
+        try:
+            payload = json.dumps(
+                {k: v for k, v in data.items() if k != "signature"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            signature = base64.urlsafe_b64decode(sig_b64 + "==")
+
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+                Ed25519PublicKey,
+            )
+
+            key_path = Path(__file__).parent / "keys" / "public_key.pem"
+            pub = serialization.load_pem_public_key(key_path.read_bytes())
+            if not isinstance(pub, Ed25519PublicKey):
+                logger.error("[crl] Bundled public key is not Ed25519")
+                return False
+            pub.verify(signature, payload)
+            return True
+        except Exception as exc:
+            logger.warning("[crl] CRL signature verification error: %s", exc)
+            return False
+
     def check_license(self, info: LicenseInfo) -> None:
         """检查 license 是否被撤销（集成点）。
 
@@ -293,7 +380,7 @@ class CRLChecker:
             LicenseRevokedError: license 被撤销
             CRLError: 严格模式下无法获取 CRL
         """
-        entry = self._find_revocation(info.customer)
+        entry = self._find_revocation(info.customer, getattr(info, "license_id", ""))
         if entry is not None:
             raise LicenseRevokedError(
                 info.customer,

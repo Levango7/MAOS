@@ -443,20 +443,27 @@ class QuotaManager:
         *,
         period: str = "total",
     ) -> int:
-        """增量更新使用量(可正可负). 返回更新后的 used 值."""
+        """增量更新使用量(可正可负). 返回更新后的 used 值.
+
+        P1 #20 fix: 负增量仍允许(并发类资源释放语义), 但结果被钳制到
+        ``>= 0`` —— 旧实现允许 used 变为负数, 导致配额统计失真。
+        """
         if amount == 0:
             return self.get_usage(tenant_id, resource).used
         key = self._period_key(period)
         now = time.time()
         with sqlite_connect(self._db_path) as conn:
+            # VALUES 侧 MAX(0, ?) 只处理"新行 + 负增量"的建行情形；
+            # DO UPDATE 侧必须用原始 amount 参数（不能用 excluded.used，
+            # 那是被钳制过的值，会让负增量恒等于 +0，释放语义失效）。
             conn.execute(
                 """INSERT INTO tenant_usage
                    (tenant_id, resource, period_key, used, updated_at)
-                   VALUES (?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, MAX(0, ?), ?)
                    ON CONFLICT(tenant_id, resource, period_key) DO UPDATE SET
-                     used = used + excluded.used,
+                     used = MAX(0, tenant_usage.used + ?),
                      updated_at = excluded.updated_at""",
-                (tenant_id, resource, key, amount, now),
+                (tenant_id, resource, key, amount, now, amount),
             )
             row = conn.execute(
                 "SELECT used FROM tenant_usage "
@@ -656,23 +663,126 @@ class QuotaManager:
     def consume(
         self, tenant_id: str, resource: str, amount: int = 1,
     ) -> QuotaCheckResult:
-        """检查 + 记录使用量. 检查通过才更新 usage."""
-        result = self.check_quota(tenant_id, resource, amount)
-        if not result.allowed:
-            return result
-        # 检查通过(含软限制放行)→ 记录使用量
-        # 使用配额的 period 来决定 update_usage 的 period
+        """检查 + 记录使用量.
+
+        P1 #20 fix: 旧实现是 check_quota(读) → update_usage(写) 两步操作,
+        多副本/并发下存在 TOCTOU —— 多个请求可同时通过检查然后各自累加,
+        突破硬限制。现改为**单条条件 UPDATE**: 硬限制检查与扣减在数据库
+        层原子完成, ``rowcount=0`` 即表示超限拒绝。
+
+        无配额设置(hard_limit=0 或无记录)→ 无条件放行(fail-open 一致)。
+        """
+        if amount < 0:
+            # 释放资源请直接用 update_usage; consume 仅用于增量消费
+            return QuotaCheckResult(
+                allowed=False, reason="consume() requires amount >= 0"
+            )
+
+        # 读配额取 period + soft_limit(此处容忍缓存陈旧,仅影响告警精度)
         try:
             quota = self.get_quota(tenant_id, resource)
-            period = quota.period if quota else "total"
-            self.update_usage(tenant_id, resource, amount, period=period)
         except Exception as exc:
             logger.warning(
-                "[quota] consume record failed (check passed) "
+                "[quota] consume check failed (fail-open) "
                 "tenant=%s resource=%s: %s",
                 tenant_id, resource, exc,
             )
-        return result
+            return QuotaCheckResult(allowed=True, reason="")
+        period = quota.period if quota else "total"
+        soft = quota.soft_limit if quota else 0
+        hard = quota.hard_limit if quota else 0
+        key = self._period_key(period)
+        now = time.time()
+
+        try:
+            with sqlite_connect(self._db_path) as conn:
+                # 确保 usage 行存在(不覆盖已有值)
+                conn.execute(
+                    """INSERT INTO tenant_usage
+                       (tenant_id, resource, period_key, used, updated_at)
+                       VALUES (?, ?, ?, 0, ?)
+                       ON CONFLICT(tenant_id, resource, period_key) DO NOTHING""",
+                    (tenant_id, resource, key, now),
+                )
+                # 原子检查+扣减: 无配额/不限/未超限才累加
+                cur = conn.execute(
+                    """UPDATE tenant_usage
+                       SET used = used + ?, updated_at = ?
+                       WHERE tenant_id = ? AND resource = ? AND period_key = ?
+                         AND (
+                           (SELECT hard_limit FROM tenant_quotas
+                              WHERE tenant_id = ? AND resource = ?) IS NULL
+                           OR (SELECT hard_limit FROM tenant_quotas
+                                WHERE tenant_id = ? AND resource = ?) <= 0
+                           OR used + ? <= (SELECT hard_limit FROM tenant_quotas
+                                            WHERE tenant_id = ? AND resource = ?)
+                         )""",
+                    (amount, now, tenant_id, resource, key,
+                     tenant_id, resource,
+                     tenant_id, resource,
+                     amount, tenant_id, resource),
+                )
+                if cur.rowcount == 0:
+                    # 硬限制拒绝
+                    usage_row = conn.execute(
+                        "SELECT used FROM tenant_usage "
+                        "WHERE tenant_id = ? AND resource = ? AND period_key = ?",
+                        (tenant_id, resource, key),
+                    ).fetchone()
+                    used_now = usage_row[0] if usage_row else 0
+                    alert_id = self._record_alert(
+                        tenant_id, resource, "hard_exceeded",
+                        current_value=used_now + amount, limit_value=hard,
+                        severity="critical",
+                        message=(
+                            f"Hard limit exceeded for {resource}: "
+                            f"projected {used_now + amount} > limit {hard}"
+                        ),
+                    )
+                    return QuotaCheckResult(
+                        allowed=False,
+                        reason=(
+                            f"Quota exceeded: tenant={tenant_id} resource={resource} "
+                            f"used={used_now} hard_limit={hard} requested={amount}"
+                        ),
+                        alert_id=alert_id,
+                    )
+                usage_row = conn.execute(
+                    "SELECT used FROM tenant_usage "
+                    "WHERE tenant_id = ? AND resource = ? AND period_key = ?",
+                    (tenant_id, resource, key),
+                ).fetchone()
+                used = usage_row[0] if usage_row else amount
+        except Exception as exc:
+            # fail-open: DB 错误时不阻塞业务
+            logger.warning(
+                "[quota] consume failed (fail-open) tenant=%s resource=%s: %s",
+                tenant_id, resource, exc,
+            )
+            return QuotaCheckResult(allowed=True, reason="")
+
+        self._cache_invalidate(tenant_id, resource)
+
+        # 软限制检查(放行但告警)
+        if soft > 0 and used > soft:
+            alert_id = self._record_alert(
+                tenant_id, resource, "soft_exceeded",
+                current_value=used, limit_value=soft,
+                severity="warning",
+                message=(
+                    f"Soft limit exceeded for {resource}: "
+                    f"used {used} > soft {soft}"
+                ),
+            )
+            return QuotaCheckResult(
+                allowed=True,
+                warning=(
+                    f"Approaching quota limit: {resource} "
+                    f"used {used} > soft {soft}"
+                ),
+                alert_id=alert_id,
+            )
+        return QuotaCheckResult(allowed=True, reason="")
 
     # ── 告警 ───────────────────────────────────────────────────────
 

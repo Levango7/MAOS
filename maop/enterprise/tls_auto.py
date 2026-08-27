@@ -3,8 +3,11 @@
 When MAOP_EDITION=enterprise, TLS is auto-enabled with sensible defaults:
   - Auto-generate self-signed certs for development
   - Enforce TLSv1.2+ minimum
-  - HSTS headers
-  - Certificate rotation hooks
+  - Cert/key pair match validation before SSL context creation (P1 #25)
+
+TODO(P1 #25): 以下能力在旧文档中声称存在但实际未实现：
+  - HSTS headers（需中间件支持，当前无）
+  - Certificate rotation hooks（无轮换调度/ACME 集成）
 """
 
 from __future__ import annotations
@@ -91,7 +94,44 @@ def _ensure_dev_certs() -> tuple[str, str]:
         return "", ""
 
 
+def _cert_key_pair_matches(cert_file: str, key_file: str) -> bool:
+    """校验证书与私钥匹配（P1 #25）。
+
+    比较 ``cert.public_key()`` 与私钥派生的公钥的 PEM 编码。
+    读取/解析失败返回 False（fail-closed，由调用方拒绝启动 TLS）。
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.x509 import load_pem_x509_certificate
+
+        cert_pem = open(cert_file, "rb").read()  # noqa: SIM115
+        key_pem = open(key_file, "rb").read()  # noqa: SIM115
+        cert = load_pem_x509_certificate(cert_pem)
+        private_key = serialization.load_pem_private_key(key_pem, password=None)
+        cert_pub = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        key_pub = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return cert_pub == key_pub
+    except Exception as e:
+        logger.error("[tls-auto] cert/key match validation failed: %s", e)
+        return False
+
+
 def _build_ssl_kwargs(cert_file: str, key_file: str) -> dict[str, Any]:
+    # P1 #25: 证书/私钥不匹配时拒绝构造 SSL context（旧实现直接交给
+    # create_ssl_context，底层报错信息晦涩且可能被静默吞掉）
+    if not _cert_key_pair_matches(cert_file, key_file):
+        logger.error(
+            "[tls-auto] Certificate %s does not match private key %s — "
+            "refusing to build SSL context",
+            cert_file, key_file,
+        )
+        return {}
     try:
         from maop.core.security.tls import TLSSettings, create_ssl_context
         min_ver = os.getenv("MAOP_TLS_MIN_VERSION", "TLSv1_2")

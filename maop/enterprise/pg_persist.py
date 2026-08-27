@@ -618,9 +618,17 @@ class PgLicenseStore:
                 issued_by TEXT DEFAULT '',
                 notes TEXT DEFAULT '',
                 created_at DOUBLE PRECISION DEFAULT 0,
-                updated_at DOUBLE PRECISION DEFAULT 0
+                updated_at DOUBLE PRECISION DEFAULT 0,
+                deleted_at DOUBLE PRECISION DEFAULT NULL
             )
         """)
+        # P1 #14: 旧库升级 —— 补 deleted_at 列（已存在则忽略错误）
+        try:
+            self._backend.execute(
+                "ALTER TABLE licenses ADD COLUMN deleted_at DOUBLE PRECISION DEFAULT NULL"
+            )
+        except Exception:
+            logger.debug("deleted_at column already exists", exc_info=True)
         self._backend.execute("CREATE INDEX IF NOT EXISTS idx_licenses_customer ON licenses(customer)")
         self._backend.execute("CREATE INDEX IF NOT EXISTS idx_licenses_status ON licenses(status)")
         self._backend.execute("CREATE INDEX IF NOT EXISTS idx_licenses_expires ON licenses(expires_at)")
@@ -653,8 +661,8 @@ class PgLicenseStore:
             """INSERT INTO licenses
                (license_id, customer, edition, max_users, fingerprint, features, status,
                 issued_at, expires_at, revoked_at, revoked_reason, license_key,
-                issued_by, notes, created_at, updated_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                issued_by, notes, created_at, updated_at, deleted_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (license_id) DO UPDATE SET
                  customer=EXCLUDED.customer, edition=EXCLUDED.edition,
                  max_users=EXCLUDED.max_users, fingerprint=EXCLUDED.fingerprint,
@@ -662,20 +670,29 @@ class PgLicenseStore:
                  expires_at=EXCLUDED.expires_at, revoked_at=EXCLUDED.revoked_at,
                  revoked_reason=EXCLUDED.revoked_reason, license_key=EXCLUDED.license_key,
                  issued_by=EXCLUDED.issued_by, notes=EXCLUDED.notes,
-                 updated_at=EXCLUDED.updated_at""",
+                 updated_at=EXCLUDED.updated_at, deleted_at=EXCLUDED.deleted_at""",
             (data["license_id"], data["customer"], data.get("edition", "enterprise"),
              data.get("max_users"), data.get("fingerprint"), features,
              data.get("status", "active"), data["issued_at"], data["expires_at"],
              data.get("revoked_at"), data.get("revoked_reason", ""),
              data["license_key"], data.get("issued_by", ""), data.get("notes", ""),
-             data.get("created_at", 0), data.get("updated_at", 0)),
+             data.get("created_at", 0), data.get("updated_at", 0),
+             data.get("deleted_at")),
         )
 
-    def delete_license(self, license_id: str) -> bool:
+    def soft_delete_license(self, license_id: str, deleted_at: float) -> bool:
+        """P1 #14: 软删除 —— 标记 status='deleted' + deleted_at，保留行与审计日志。
+
+        替代旧的物理删除（DELETE license + DELETE 全部审计日志），
+        避免销毁合规证据链。
+        """
         if not self._backend:
             return False
-        self._backend.execute("DELETE FROM license_audit_logs WHERE license_id=%s", (license_id,))
-        self._backend.execute("DELETE FROM licenses WHERE license_id=%s", (license_id,))
+        self._backend.execute(
+            "UPDATE licenses SET status='deleted', deleted_at=%s, updated_at=%s "
+            "WHERE license_id=%s",
+            (deleted_at, deleted_at, license_id),
+        )
         return True
 
     def load_licenses(self, status: str = "") -> list[dict[str, Any]]:
@@ -686,8 +703,9 @@ class PgLicenseStore:
                 "SELECT * FROM licenses WHERE status=%s ORDER BY created_at DESC",
                 (status,),
             ))
+        # P1 #14: 默认列表排除软删除记录
         return cast(list[dict[str, Any]], self._backend.fetchall(
-            "SELECT * FROM licenses ORDER BY created_at DESC",
+            "SELECT * FROM licenses WHERE status != 'deleted' ORDER BY created_at DESC",
         ))
 
     def load_license(self, license_id: str) -> dict[str, Any] | None:

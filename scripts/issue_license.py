@@ -37,10 +37,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import (
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 # License key prefix and edition (must match LicenseValidator parsing)
 _LICENSE_PREFIX = "MAOP-ENT-"
@@ -129,9 +126,10 @@ def issue_license(
     ------
     FileNotFoundError
         If ``private_key_path`` does not exist.
+    TypeError
+        If the loaded key is not an Ed25519 private key.
     ValueError
-        If the loaded key is not an Ed25519 private key, or ``days`` is
-        non-positive, or ``customer`` is empty.
+        If ``days`` is non-positive, or ``customer`` is empty.
     """
     if not customer.strip():
         raise ValueError("customer name must not be empty")
@@ -144,7 +142,7 @@ def issue_license(
     key_data = private_key_path.read_bytes()
     private_key = serialization.load_pem_private_key(key_data, password=None)
     if not isinstance(private_key, Ed25519PrivateKey):
-        raise ValueError(
+        raise TypeError(
             f"Expected an Ed25519 private key, got {type(private_key).__name__}"
         )
 
@@ -272,7 +270,7 @@ def main() -> None:
             args.fingerprint,
             features_list,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, TypeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 

@@ -670,11 +670,13 @@ class NotificationManager:
     def stats(self) -> dict[str, Any]:
         """Return aggregate stats for the dashboard."""
         bus_stats = self.event_bus.stats()
-        # Count notifications by status (cheap queries)
-        sent, _ = self.store.list_notifications(status="sent", limit=1)
-        pending, _ = self.store.list_notifications(status="pending", limit=1)
-        retrying, _ = self.store.list_notifications(status="retrying", limit=1)
-        dead, _ = self.store.list_notifications(status="dead_letter", limit=1)
+        # Count notifications by status (cheap queries).
+        # P1 #22 fix: list_notifications 返回 (rows, total) —— 旧代码
+        # `sent, _ = ...` 把 rows 列表当成了计数（类型错误，API 契约破坏）。
+        _, sent = self.store.list_notifications(status="sent", limit=1)
+        _, pending = self.store.list_notifications(status="pending", limit=1)
+        _, retrying = self.store.list_notifications(status="retrying", limit=1)
+        _, dead = self.store.list_notifications(status="dead_letter", limit=1)
         return {
             "event_bus": bus_stats,
             "channels": len(self.store.list_channels()),

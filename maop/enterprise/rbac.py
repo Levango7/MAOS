@@ -13,7 +13,12 @@ Permission model:
 from __future__ import annotations
 
 import logging
+import os
+import sqlite3
+import threading
 from enum import Enum
+from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -73,29 +78,170 @@ class RoleGrant(BaseModel):
     expires_at: float | None = None
 
 
-class RBACManager:
-    """Enterprise RBAC permission checker with optional PG persistence."""
+class SqliteRBACStore:
+    """SQLite-backed RBAC grant persistence (P1 #12).
 
-    def __init__(self) -> None:
+    PostgreSQL 不可用时的持久化兜底（此前仅内存，进程重启授权全丢）。
+    接口与 :class:`maop.enterprise.pg_persist.PgRBACStore` 对齐，schema
+    保持一致：``UNIQUE(user_id, role, tenant_id)`` + upsert 语义。
+
+    数据库文件：``$MAOP_DATA_DIR/rbac.db``（默认 ``data/rbac.db``）。
+    """
+
+    def __init__(self, db_path: str | Path | None = None) -> None:
+        if db_path is None:
+            data_dir = Path(os.getenv("MAOP_DATA_DIR", "data"))
+            data_dir.mkdir(parents=True, exist_ok=True)
+            db_path = data_dir / "rbac.db"
+        self.db_path = str(db_path)
+        self._lock = threading.RLock()
+        self._ok = True
+        try:
+            with self._connect() as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS rbac_grants (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        tenant_id TEXT DEFAULT '',
+                        granted_by TEXT DEFAULT '',
+                        granted_at REAL DEFAULT 0,
+                        expires_at REAL DEFAULT NULL,
+                        UNIQUE(user_id, role, tenant_id)
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_rbac_user ON rbac_grants(user_id)"
+                )
+        except Exception as exc:
+            self._ok = False
+            logger.warning("[rbac] SQLite store unavailable: %s", exc)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    @property
+    def available(self) -> bool:
+        return self._ok
+
+    def save_grant(
+        self,
+        user_id: str,
+        role: str,
+        tenant_id: str,
+        granted_by: str,
+        granted_at: float,
+        expires_at: float | None,
+    ) -> None:
+        if not self._ok:
+            return
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO rbac_grants
+                      (user_id, role, tenant_id, granted_by, granted_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT (user_id, role, tenant_id) DO UPDATE SET
+                      granted_by=excluded.granted_by,
+                      granted_at=excluded.granted_at,
+                      expires_at=excluded.expires_at""",
+                (user_id, role, tenant_id, granted_by, granted_at, expires_at),
+            )
+
+    def delete_grant(self, user_id: str, role: str, tenant_id: str) -> bool:
+        if not self._ok:
+            return False
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "DELETE FROM rbac_grants WHERE user_id=? AND role=? AND tenant_id=?",
+                (user_id, role, tenant_id),
+            )
+        return True
+
+    def load_grants(self, user_id: str = "", tenant_id: str = "") -> list[dict[str, Any]]:
+        if not self._ok:
+            return []
+        if user_id and tenant_id:
+            sql = ("SELECT * FROM rbac_grants WHERE user_id=? "
+                   "AND (tenant_id=? OR tenant_id='')")
+            params: tuple = (user_id, tenant_id)
+        elif user_id:
+            sql = "SELECT * FROM rbac_grants WHERE user_id=?"
+            params = (user_id,)
+        elif tenant_id:
+            sql = "SELECT * FROM rbac_grants WHERE tenant_id=? OR tenant_id=''"
+            params = (tenant_id,)
+        else:
+            sql = "SELECT * FROM rbac_grants"
+            params = ()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+class RBACManager:
+    """Enterprise RBAC permission checker.
+
+    持久化优先级（P1 #12）：PostgreSQL > SQLite > 内存（仅测试兜底）。
+
+    Parameters
+    ----------
+    sqlite_store : SqliteRBACStore | None
+        显式指定 SQLite store（如测试用 tmp 路径）。None 时按
+        ``enable_sqlite_fallback`` 决定是否创建默认 store。
+    enable_sqlite_fallback : bool
+        PG 不可用时是否启用默认 SQLite 兜底（``data/rbac.db``）。
+        测试可传 False 获得纯内存隔离实例。
+    """
+
+    def __init__(
+        self,
+        *,
+        sqlite_store: SqliteRBACStore | None = None,
+        enable_sqlite_fallback: bool = True,
+    ) -> None:
         require_feature(FeatureFlag.RBAC)
         self._grants: list[RoleGrant] = []
         self._pg: PgRBACStore | None = None
+        self._sqlite: SqliteRBACStore | None = None
         try:
             from maop.enterprise.pg_persist import PgRBACStore
             pg = PgRBACStore()
             if pg.available:
                 self._pg = pg
-                self._load_from_pg()
         except Exception as e:
             logger.debug("ignored: %s", e, exc_info=True)
+        if self._pg is None:
+            if sqlite_store is not None:
+                self._sqlite = sqlite_store
+            elif enable_sqlite_fallback:
+                try:
+                    store = SqliteRBACStore()
+                    if store.available:
+                        self._sqlite = store
+                        logger.info(
+                            "[rbac] using SQLite store at %s (PG unavailable)",
+                            store.db_path,
+                        )
+                except Exception as e:
+                    logger.warning("[rbac] SQLite fallback failed: %s", e)
+        self._load_from_store()
 
-    def _load_from_pg(self) -> None:
-        if not self._pg:
+    def _load_from_store(self) -> None:
+        store = self._pg or self._sqlite
+        if store is None or not store.available:
             return
-        for row in self._pg.load_grants():
+        for row in store.load_grants():
+            try:
+                role = Role(row.get("role", "viewer"))
+            except ValueError:
+                logger.warning("[rbac] skipping grant with unknown role: %r", row.get("role"))
+                continue
             self._grants.append(RoleGrant(
                 user_id=row.get("user_id", ""),
-                role=Role(row.get("role", "viewer")),
+                role=role,
                 tenant_id=row.get("tenant_id", ""),
                 granted_by=row.get("granted_by", ""),
                 granted_at=row.get("granted_at", 0.0),
@@ -125,9 +271,19 @@ class RBACManager:
             user_id=user_id, role=role, tenant_id=tenant_id,
             granted_by=granted_by, granted_at=now, expires_at=expires_at,
         )
+        # P1 #12: 内存去重 —— 与 DB 的 UNIQUE(user_id, role, tenant_id) upsert
+        # 语义对齐（旧实现直接 append，重复授权会在 user_roles 中重复出现）
+        self._grants = [
+            g for g in self._grants
+            if not (g.user_id == user_id and g.role == role and g.tenant_id == tenant_id)
+        ]
         self._grants.append(grant)
-        if self._pg:
-            self._pg.save_grant(user_id, role.value, tenant_id, granted_by, now, expires_at)
+        store = self._pg or self._sqlite
+        if store is not None and store.available:
+            try:
+                store.save_grant(user_id, role.value, tenant_id, granted_by, now, expires_at)
+            except Exception as exc:
+                logger.warning("[rbac] persist grant failed (in-memory only): %s", exc)
         logger.info("[rbac] Granted %s to user=%s tenant=%s by=%s expires_at=%s",
                     role.value, user_id, tenant_id, granted_by, expires_at)
         return grant
@@ -140,8 +296,12 @@ class RBACManager:
         ]
         removed = before - len(self._grants)
         if removed:
-            if self._pg:
-                self._pg.delete_grant(user_id, role.value, tenant_id)
+            store = self._pg or self._sqlite
+            if store is not None and store.available:
+                try:
+                    store.delete_grant(user_id, role.value, tenant_id)
+                except Exception as exc:
+                    logger.warning("[rbac] persist revoke failed: %s", exc)
             logger.info("[rbac] Revoked %s from user=%s tenant=%s", role.value, user_id, tenant_id)
         return removed > 0
 

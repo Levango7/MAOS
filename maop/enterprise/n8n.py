@@ -230,18 +230,37 @@ class N8nClient:
         workflow_id: str,
         data: dict[str, Any] | None = None,
         wait_for_completion: bool = False,
+        webhook_path: str = "",
+        use_test_webhook: bool = False,
     ) -> N8nWorkflowExecution:
-        """Trigger an n8n workflow by ID.
+        """Trigger an n8n workflow via its Webhook trigger node.
+
+        P1 #21 fix: 旧实现调用 ``POST /api/v1/workflows/{id}/execute``，
+        该端点在 n8n API 中不存在（恒 404）。n8n 的外部触发机制是
+        工作流内的 Webhook trigger node：
+
+          - 生产（已激活工作流）: ``POST {base_url}/webhook/{path}``
+          - 编辑器测试: ``POST {base_url}/webhook-test/{path}``
+
+        webhook path 在 Webhook node 上配置；未指定时用 workflow_id
+        作为 path（n8n 默认值）。注意 webhook URL 不走 ``/api/v1``
+        前缀；鉴权跟随 Webhook node 配置（如 Header Auth），api_key
+        仍会以 ``X-N8N-API-KEY`` 头附带。
 
         Parameters
         ----------
         workflow_id : str
-            The n8n workflow ID to trigger.
+            The n8n workflow ID to trigger（同时作为默认 webhook path）。
         data : dict, optional
-            Input data to pass to the workflow's trigger node.
+            Input data POSTed as JSON body to the webhook trigger node.
         wait_for_completion : bool
-            If True, block until workflow execution finishes.
-            If False, return immediately with status="running".
+            保留参数（签名兼容）。实际响应时机由 Webhook node 的
+            "Respond" 模式决定：设为 "When workflow finishes" 时响应
+            含执行结果；"Immediately" 时立即返回、本方法 status="running"。
+        webhook_path : str
+            覆盖 webhook path（工作流 Webhook node 自定义 path 时使用）。
+        use_test_webhook : bool
+            True 时走 ``/webhook-test/``（仅编辑器测试运行有效）。
 
         Returns
         -------
@@ -250,40 +269,53 @@ class N8nClient:
         """
         require_n8n_feature()
 
-        client = self._get_client()
-        payload = {"data": data or {}}
+        path = webhook_path or workflow_id
+        segment = "webhook-test" if use_test_webhook else "webhook"
+        url = f"{self._base_url}/{segment}/{path}"
+
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["X-N8N-API-KEY"] = self._api_key
 
         try:
-            if wait_for_completion:
-                # Use webhook path for synchronous execution
-                resp = client.post(
-                    f"/workflows/{workflow_id}/execute",
-                    json=payload,
-                    params={"wait": "true"},
-                )
-            else:
-                # Async: just activate the workflow trigger
-                resp = client.post(f"/workflows/{workflow_id}/execute", json=payload)
-
+            resp = httpx.post(url, json=data or {}, headers=headers, timeout=self._timeout_s)
             resp.raise_for_status()
-            result = resp.json()
-
-            return N8nWorkflowExecution(
-                execution_id=str(result.get("executionId", "")),
-                workflow_id=workflow_id,
-                status=result.get("status", "running"),
-                started_at=datetime.now(timezone.utc),
-                finished_at=datetime.now(timezone.utc) if result.get("status") == "success" else None,
-                data=result.get("data"),
-                error=result.get("error"),
-            )
-
         except httpx.HTTPStatusError as exc:
             raise N8nIntegrationError(
-                f"n8n API returned {exc.response.status_code}: {exc.response.text}"
+                f"n8n webhook returned {exc.response.status_code}: {exc.response.text}"
             ) from exc
         except httpx.RequestError as exc:
-            raise N8nIntegrationError(f"Failed to connect to n8n at {self._base_url}: {exc}") from exc
+            raise N8nIntegrationError(
+                f"Failed to connect to n8n webhook at {url}: {exc}"
+            ) from exc
+
+        # 响应体取决于 Webhook node 的 respond 模式；容忍非 JSON 响应
+        result: dict[str, Any] = {}
+        try:
+            parsed = resp.json()
+            if isinstance(parsed, dict):
+                result = parsed
+        except ValueError:
+            pass
+
+        now = datetime.now(timezone.utc)
+        status = str(result.get("status") or "")
+        if not status:
+            # 立即响应模式：无执行状态可取 → 视为 running
+            status = "success" if result else "running"
+        finished = status in ("success", "error", "crashed")
+        data_out = result.get("data")
+        if not isinstance(data_out, dict):
+            data_out = result or None
+        return N8nWorkflowExecution(
+            execution_id=str(result.get("executionId", "")),
+            workflow_id=workflow_id,
+            status=status,
+            started_at=now,
+            finished_at=now if finished else None,
+            data=data_out,
+            error=str(result["error"]) if result.get("error") else None,
+        )
 
     def get_execution(self, execution_id: str) -> N8nWorkflowExecution:
         """Get the status of a workflow execution."""

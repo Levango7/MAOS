@@ -5,8 +5,10 @@ Phase 3.4 implementation: distributed coordination via Redis lease.
 When Redis is available (MAOP_HA_BACKEND=redis):
   - Leader election via SET NX EX lease with fencing tokens
   - Automatic failover when leader lease expires
-  - Cross-process cluster state via Redis pub/sub
   - Split-brain protection via fencing tokens
+  - TODO(P1 #24): cross-process cluster state sync via Redis pub/sub
+    is NOT implemented yet — node registry/heartbeats are currently
+    per-process; only the leader lease is shared across processes.
 
 When Redis is unavailable:
   - Falls back to single-instance in-memory mode (Phase 3.2 behavior)
@@ -115,6 +117,17 @@ class HAManager:
         # Health monitor state
         self._monitor_thread: threading.Thread | None = None
         self._monitor_stop = threading.Event()
+        # P1 #24: 节点注册鉴权钩子（可选）——register_node 前调用，
+        # 返回 False 拒绝注册。默认 None 表示不鉴权（向后兼容）。
+        self._node_auth_callback: Any = None
+
+    def set_node_authenticator(self, callback: Any) -> None:
+        """设置节点注册鉴权回调（P1 #24）。
+
+        ``callback(node_id: str, address: str) -> bool``；返回 False 时
+        :meth:`register_node` 抛 ``PermissionError``。传入 None 关闭鉴权。
+        """
+        self._node_auth_callback = callback
 
     @property
     def config(self) -> HAConfig:
@@ -157,6 +170,17 @@ class HAManager:
         return self._lock
 
     def register_node(self, node_id: str, address: str) -> ClusterNode:
+        # P1 #24: 鉴权钩子 —— 旧实现任何调用方都能注册节点进入集群
+        if self._node_auth_callback is not None:
+            try:
+                allowed = bool(self._node_auth_callback(node_id, address))
+            except Exception as exc:
+                logger.warning("[ha] node auth callback error, denying: %s", exc)
+                allowed = False
+            if not allowed:
+                raise PermissionError(
+                    f"Node registration rejected by authenticator: node={node_id}"
+                )
         with self._state_lock:
             node = ClusterNode(node_id=node_id, address=address, last_heartbeat=time.time())
             self._nodes[node_id] = node

@@ -13,10 +13,12 @@ API 响应时通过 :func:`mask_sensitive_fields` 脱敏（PRD NFR-S07）。
 
 from __future__ import annotations
 
+import base64
 import builtins
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -56,52 +58,105 @@ def mask_sensitive_fields(config: dict[str, Any]) -> dict[str, Any]:
     return masked
 
 
-# ── Fernet 加密 helper（复用 ApiKeyVault 主密钥） ────────────────────
-def _get_fernet() -> Any:
-    """获取 Fernet 实例（复用 ApiKeyVault 的主密钥解析逻辑）。
+# ── Fernet 加密 helper（与 ApiKeyVault 同一主密钥体系） ────────────────
+_FERNET: Any = None
+_FERNET_LOCK = threading.Lock()
 
-    若 cryptography 未安装或密钥不可用，返回 None（降级为明文 + 警告）。
+
+def _resolve_master_key() -> bytes:
+    """解析主密钥（与 ``ApiKeyVault`` 的解析顺序一致，共享同一密钥体系）。
+
+    顺序：
+      1. ``MAOP_KEY`` 环境变量（32 字节 urlsafe-base64 或 44 字符 Fernet key）
+      2. ``MAOP_KEY_FILE`` 环境变量指定的密钥文件
+      3. ``data/.enc_key``（默认路径，与 ApiKeyVault 一致；不存在则生成）
+
+    不复用 ``ApiKeyVault._fernet`` 私有成员（P1 #19），但解析规则保持
+    一致，确保两个模块加密的数据可互相解密。
     """
+    env_key = os.environ.get("MAOP_KEY", "").strip()
+    if env_key:
+        # 32 字节原始密钥的 urlsafe-base64 编码 → 规范化为 Fernet 形式
+        try:
+            raw = base64.urlsafe_b64decode(env_key)
+            if len(raw) == 32:
+                return base64.urlsafe_b64encode(raw)
+        except Exception:
+            logger.debug("[sso_store] MAOP_KEY is not a 32-byte base64 value")
+        # 44 字符规范化 Fernet key（容忍缺失 '=' 填充）
+        try:
+            base64.urlsafe_b64decode(env_key + "=" * (-len(env_key) % 4))
+            if len(env_key) == 44:
+                return env_key.encode("ascii")
+        except Exception:
+            logger.warning(
+                "[sso_store] MAOP_KEY set but undecodable; falling through to key file"
+            )
+
+    key_file = os.environ.get("MAOP_KEY_FILE", "").strip()
+    key_path = Path(key_file) if key_file else Path("data") / ".enc_key"
+    if key_path.exists():
+        try:
+            return key_path.read_bytes().strip()
+        except Exception as exc:
+            logger.warning("[sso_store] Failed to read key file %s: %s", key_path, exc)
+
+    # 首次使用：生成密钥（与 ApiKeyVault 的默认行为一致）
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key()
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.write_bytes(key)
     try:
-        from cryptography.fernet import Fernet  # noqa: F401
-    except ImportError:
-        logger.warning("[sso_store] cryptography not installed — secrets stored in plaintext")
-        return None
-    try:
-        from maop.core.security.api_key_vault import ApiKeyVault
-        vault = ApiKeyVault()
-        return vault._fernet
-    except Exception as exc:  # pragma: no cover — 防御性
-        logger.warning("[sso_store] Cannot obtain Fernet from ApiKeyVault: %s", exc)
-        return None
+        os.chmod(str(key_path), 0o600)
+    except Exception:
+        pass
+    logger.info("[sso_store] Generated new encryption key at %s", key_path)
+    return key  # type: ignore
+
+
+def _get_fernet() -> Any:
+    """获取 Fernet 实例（进程内单例）。
+
+    P1 #19 fix: cryptography 缺失时让 ``ImportError`` 向上传播
+    （fail-closed）——旧实现降级为明文存储 IdP client_secret，
+    违反 NFR-S01。cryptography 已是 maop-enterprise 核心依赖。
+    """
+    global _FERNET
+    if _FERNET is not None:
+        return _FERNET
+    with _FERNET_LOCK:
+        if _FERNET is None:
+            from cryptography.fernet import Fernet
+
+            _FERNET = Fernet(_resolve_master_key())
+    return _FERNET
 
 
 def _encrypt_secret(plaintext: str) -> str:
-    """加密单个敏感字段。返回 ``<enc:...>`` 标记的密文或明文（降级）。"""
+    """加密单个敏感字段（P1 #19：不再降级明文，加密失败即抛异常）。"""
     if not plaintext:
         return ""
     fernet = _get_fernet()
-    if fernet is None:
-        return plaintext  # 降级：明文存储 + 已有警告
-    try:
-        return str(fernet.encrypt(plaintext.encode("utf-8")).decode("ascii"))
-    except Exception as exc:  # pragma: no cover
-        logger.warning("[sso_store] encrypt failed: %s", exc)
-        return plaintext
+    return str(fernet.encrypt(plaintext.encode("utf-8")).decode("ascii"))
 
 
 def _decrypt_secret(ciphertext: str) -> str:
-    """解密单个敏感字段。"""
+    """解密单个敏感字段。
+
+    解密失败时返回原值（兼容旧版本明文降级存储的历史数据，P1 #19
+    之前的 fallback 会把明文直接写入 ``*_enc`` 列）。
+    """
     if not ciphertext:
         return ""
-    fernet = _get_fernet()
-    if fernet is None:
-        return ciphertext
     try:
+        fernet = _get_fernet()
         return str(fernet.decrypt(ciphertext.encode("ascii")).decode("utf-8"))
     except Exception as exc:
-        logger.warning("[sso_store] decrypt failed: %s", exc)
-        return ""
+        logger.warning(
+            "[sso_store] decrypt failed (legacy plaintext or wrong key): %s", exc
+        )
+        return ciphertext
 
 
 def _encrypt_config(config: dict[str, Any]) -> dict[str, Any]:
