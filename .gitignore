@@ -10,6 +10,11 @@ build/
 .mypy_cache/
 .ruff_cache/
 .venv/
+# Coverage reports (pytest --cov artifact)
+.coverage
+htmlcov/
+# Local tooling state (ZCode session/plan files)
+.zcode/
 
 # Signing keys — NEVER commit private keys (test or production)
 # Test signing key (used by issue_test_license.py / issue_license.py default)
@@ -23,4 +28,6 @@ data/license.key
 # CRL cache (runtime artifact)
 data/crl_cache.json
 # Runtime logs
-data/*.log
+data/*.log 
+# Integrity manifest — build artifact, signed at release/CI (P0 #7) 
+maop/enterprise/_integrity_manifest.json 

@@ -41,8 +41,9 @@ docstring of ``config/edition.py`` for the OPTIONAL backends policy.
 from __future__ import annotations
 
 import logging
+import os
 
-from maop.config.edition import Edition, get_edition
+from maop.config.edition import Edition, get_edition, record_degradation
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,51 @@ else:
         "[enterprise] maop.enterprise importable but no valid license — "
         "running as personal edition. Set MAOP_LICENSE_KEY to activate."
     )
+
+
+def _run_integrity_check() -> None:
+    """P0 #7: 启动时执行企业模块完整性校验（此前 verify_module_integrity
+    是死代码，从无任何调用点）。
+
+    行为：
+      - ``MAOP_SKIP_INTEGRITY=1`` → 跳过（测试/开发逃生舱）。
+      - manifest 缺失：开发环境静默跳过（尚未签名属正常）；生产环境
+        （``MAOP_ENV=production``）视为篡改嫌疑，抛 ModuleTamperError 阻断。
+      - manifest 存在但校验失败（签名错/文件被改）→ 记录降级 + 告警；
+        生产环境由 verify_module_integrity 的 strict 模式直接抛异常。
+    """
+    from maop.enterprise.license import (
+        ModuleTamperError,
+        verify_module_integrity,
+    )
+
+    try:
+        ok, reason = verify_module_integrity()
+    except ModuleTamperError:
+        record_degradation(
+            "integrity", "enterprise", "blocked", reason="module_tamper_detected"
+        )
+        raise
+    if ok:
+        if reason != "skipped":
+            logger.debug("[enterprise] module integrity verified: %s", reason)
+        return
+    if "manifest not found" in reason:
+        # 开发/CI 未签名场景：不记降级，仅提示
+        logger.info(
+            "[enterprise] integrity manifest not present — skipping module "
+            "verification (run scripts/sign_enterprise_modules.py to sign)"
+        )
+        return
+    record_degradation(
+        "integrity", "enterprise", "personal", reason=f"integrity_check_failed:{reason}"
+    )
+    logger.warning("[enterprise] module integrity check failed: %s", reason)
+
+
+# 测试逃生舱：显式跳过时不执行任何检查逻辑
+if os.getenv("MAOP_SKIP_INTEGRITY", "").strip().lower() not in ("1", "true", "yes"):
+    _run_integrity_check()
 
 __all__: list[str] = [
     "audit",
