@@ -1,12 +1,17 @@
 [project]
 name = "maop-enterprise"
-version = "5.1.0"
+version = "5.2.0"
 description = "MAOP Enterprise Extension — RBAC, multi-tenant, SSO, audit, HA, and cloud backends"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Commercial"}
 dependencies = [
-    "maop>=5.1.0,<6.0.0",
+    # MAOP 基础包 PyPI 名（2026-08 由 maop 改为 maop-orchestrator，见 MAOP b64e418）
+    "maop-orchestrator>=5.1.0,<6.0.0",
+    # license 签名验证 / SSO store 加密 / TLS 自动化均依赖 cryptography（核心路径）
+    "cryptography>=42.0",
+    # n8n 集成模块级导入
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -27,13 +32,15 @@ etcd = [
     "etcd3>=0.12",
 ]
 sso-saml = [
-    "python3-saml>=1.14",
+    # SAML 2.0 自研实现（saml_handler.py）实际使用 lxml + defusedxml
+    "lxml>=5.0",
+    "defusedxml>=0.7",
 ]
 sso-oidc = [
     "authlib>=1.3",
 ]
 all = [
-    "maop-enterprise[postgresql,redis,rabbitmq,vault,etcd,sso-oidc]",
+    "maop-enterprise[postgresql,redis,rabbitmq,vault,etcd,sso-saml,sso-oidc]",
 ]
 dev = [
     "pytest>=8.0",
