@@ -6,8 +6,9 @@
 #
 # 依赖说明：
 #   - MAOP 基础包（maop-orchestrator）未发布到 PyPI，需从 Levango7/MAOP
-#     仓库检出后 editable 安装。该仓库为私有仓库，需在 Settings → Secrets
-#     配置 MAOP_ACCESS_TOKEN（具备 MAOP 仓库读取权限的 PAT）。
+#     仓库检出后 editable 安装。该仓库当前为公开仓库，默认 GITHUB_TOKEN
+#     即可检出；若未来转为私有，在 Settings → Secrets 配置
+#     MAOP_ACCESS_TOKEN（具备 MAOP 仓库读取权限的 PAT）后自动生效。
 #   - 测试签名密钥被 gitignore，CI 中用 ci_generate_test_key.py 动态生成
 #     临时密钥对（覆盖打包公钥），再签发测试 license。
 # ─────────────────────────────────────────────────────────────────────
@@ -45,8 +46,11 @@ jobs:
         with:
           repository: Levango7/MAOP
           path: maop-base
-          # 私有仓库需要 PAT secret（Settings → Secrets → MAOP_ACCESS_TOKEN）
-          token: ${{ secrets.MAOP_ACCESS_TOKEN }}
+          # MAOP 当前为公开仓库，默认 GITHUB_TOKEN 足够；secret 存在时优先
+          # 使用（为将来仓库转私有预留）。注意不能直接写
+          # secrets.MAOP_ACCESS_TOKEN —— secret 未配置时表达式为空串，
+          # actions/checkout 会以 "Input required and not supplied: token" 失败。
+          token: ${{ secrets.MAOP_ACCESS_TOKEN || github.token }}
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -91,7 +95,7 @@ jobs:
           ruff check maop/ tests/
 
   # ── Coverage gate ────────────────────────────────────────────────
-  # TODO: 当前实测覆盖率约 34%，门禁暂设 35%；随测试补全逐步提升至 70%。
+  # 当前实测覆盖率 52.03%，门禁设 35% 留回归缓冲；随测试补全逐步提升至 70%。
   coverage:
     name: Coverage (≥35%)
     runs-on: ubuntu-latest
@@ -105,7 +109,7 @@ jobs:
         with:
           repository: Levango7/MAOP
           path: maop-base
-          token: ${{ secrets.MAOP_ACCESS_TOKEN }}
+          token: ${{ secrets.MAOP_ACCESS_TOKEN || github.token }}
 
       - uses: actions/setup-python@v5
         with:
