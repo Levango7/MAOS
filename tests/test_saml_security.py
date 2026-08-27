@@ -29,10 +29,10 @@ from cryptography.x509.oid import NameOID
 pytest.importorskip("lxml", reason="requires sso-saml extra")
 pytest.importorskip("defusedxml", reason="requires sso-saml extra")
 
-from lxml import etree  # noqa: E402
+from lxml import etree
 
-from maop.enterprise.saml_handler import SAMLHandler  # noqa: E402
-from maop.enterprise.sso import SSOConfig, SSOError, SSOProvider  # noqa: E402
+from maop.enterprise.saml_handler import SAMLHandler
+from maop.enterprise.sso import SSOConfig, SSOError, SSOProvider
 
 SAMLP_NS = "urn:oasis:names:tc:SAML:2.0:protocol"
 SAML_NS = "urn:oasis:names:tc:SAML:2.0:assertion"
