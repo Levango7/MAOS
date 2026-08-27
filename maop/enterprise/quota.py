@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -42,7 +43,7 @@ logger = logging.getLogger(__name__)
 # ── 常量 ────────────────────────────────────────────────────────────
 
 #: 缓存默认 TTL(秒). 写操作会立即失效对应租户的缓存.
-DEFAULT_CACHE_TTL_S: float = 60.0
+DEFAULT_CACHE_TTL_S: float = float(os.getenv("MAOP_QUOTA_CACHE_TTL_S", "60.0"))
 
 #: 软限制告警去重窗口(秒) — 同一 (tenant, resource, type) 在窗口内只记录一次.
 ALERT_DEDUP_WINDOW_S: float = 300.0
