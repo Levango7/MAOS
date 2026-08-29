@@ -1,9 +1,9 @@
 # MAOS — MAOP Enterprise Extension
 
-> **Private repository. Commercial license.**
-> 
+> **Commercial license — proprietary code.**
+>
 > MAOS provides enterprise capabilities for MAOP (Multi-Agent Orchestration Platform):
-> RBAC, multi-tenant isolation, SSO (OIDC + SAML), audit logging, HA, 
+> RBAC, multi-tenant isolation, SSO (OIDC + SAML), audit logging, HA,
 > license management, CRL, n8n integration, and cloud backends.
 
 ## Installation

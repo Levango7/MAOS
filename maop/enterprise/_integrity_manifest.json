@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "signed_at": "2026-08-29T11:50:24.405322+00:00",
+  "signed_at": "2026-08-29T20:53:12.760008+00:00",
   "tool": "sign_enterprise_modules.py",
   "files": {
     "maop/enterprise/__init__.py": "bc76afe26d0060bbce0b62469bdff622c81ca6d601c307a937c9519e9de986f9",
@@ -30,5 +30,5 @@
     "maop/enterprise/tenant.py": "60780f3bf73ffc9b982241a51eac91187e0608748faacc2a8ebd6211d353c59e",
     "maop/enterprise/tls_auto.py": "a17949fcf89f0710ce59ba71f9970f76ef743c8bf24836c1145ed4c6f48acfb5"
   },
-  "signature": "ojfL6ng_fbF8YlbvSnTBlKnYkDvBX1UOCK9QzzhT5Qatpl8KoehXScNVtpQTxrTD93kaxRvuvZ6JtLablFBGCA"
+  "signature": "srPDNuE0q1n2fQplabVleIMBfjK6NzLAZ7WovqQBtST61QRGMalScQWELqZ0yLujz5Z3NyGihzTaE54aXAXOCA"
 }
