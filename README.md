@@ -20,8 +20,14 @@ Commercial. See LICENSE file.
 
 ## Quick Start
 
-1. Install MAOP: `pip install maop-orchestrator>=5.1.0`
-2. Install MAOP Enterprise: `pip install maop_enterprise-5.2.1-py3-none-any.whl`
+> 安装源说明：MAOP 主包与 MAOS 企业扩展均**未发布到 PyPI**，通过
+> GitHub 直接安装 / GitHub Releases 分发（无需 PyPI 账号，无需代理）。
+
+1. Install MAOP (from GitHub, subdirectory `py`):
+   `pip install "maop-orchestrator @ git+https://github.com/Levango7/MAOP.git@master#subdirectory=py"`
+2. Install MAOP Enterprise: 从 GitHub Releases 页面下载
+   `maop_enterprise-5.2.1-py3-none-any.whl` 后
+   `pip install ./maop_enterprise-5.2.1-py3-none-any.whl`
 3. Configure license: `export MAOP_LICENSE_KEY="your-license-key"`
 4. Verify: `python -c "from maop.enterprise.license import LicenseValidator; print(LicenseValidator().validate_from_env())"`
 
