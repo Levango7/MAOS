@@ -55,7 +55,7 @@
 
 ### Infrastructure / Docs
 
-- **wheel 重建为 5.2.0**（此前 dist/ 是过期的 5.1.0）：含 `cryptography`/
+- **wheel 重建为 5.2.1**（此前 dist/ 是过期的 5.1.0）：含 `cryptography`/
   `httpx` 核心依赖、`sso-saml` extra 修正为 `lxml`+`defusedxml`、含
   `sso_session_store.py` 与 `_integrity_manifest.json`（force-include，
   生产 strict 模式启动校验依赖）；旧 5.1.0 wheel 保留于 dist/

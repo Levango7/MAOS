@@ -21,11 +21,11 @@ Commercial. See LICENSE file.
 ## Quick Start
 
 1. Install MAOP: `pip install maop-orchestrator>=5.1.0`
-2. Install MAOP Enterprise: `pip install maop_enterprise-5.2.0-py3-none-any.whl`
+2. Install MAOP Enterprise: `pip install maop_enterprise-5.2.1-py3-none-any.whl`
 3. Configure license: `export MAOP_LICENSE_KEY="your-license-key"`
 4. Verify: `python -c "from maop.enterprise.license import LicenseValidator; print(LicenseValidator().validate_from_env())"`
 
-## Known Limitations（已知限制，v5.2.0）
+## Known Limitations（已知限制，v5.2.1）
 
 以下限制为当前版本的已知事实，部署前请评估（详见 `docs/security-audit-license.md` 与 CHANGELOG）：
 

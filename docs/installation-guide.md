@@ -20,7 +20,7 @@ pip install maop-orchestrator>=5.1.0
 #### 方式 A：从私有 wheel 安装（推荐）
 
 ```bash
-pip install maop_enterprise-5.2.0-py3-none-any.whl
+pip install maop_enterprise-5.2.1-py3-none-any.whl
 ```
 
 #### 方式 B：从私有 Git 仓库安装
