@@ -29,5 +29,6 @@ data/license.key
 data/crl_cache.json
 # Runtime logs
 data/*.log 
-# Integrity manifest — build artifact, signed at release/CI (P0 #7) 
-maop/enterprise/_integrity_manifest.json 
+# Integrity manifest — 已提交入库（v5.2.1 起）：随源码分发保证 clone 即自洽、
+# wheel 构建（force-include）始终有文件。代码变更后需重签并提交
+# （scripts/sign_enterprise_modules.py，发布前用生产私钥重签）。
