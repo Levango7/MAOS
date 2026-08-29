@@ -4,9 +4,9 @@ Uses SQLite (default, personal edition) or PostgreSQL (enterprise) via
 the shared storage backend abstraction. Secret fields (SMTP password,
 webhook secret) are encrypted at rest with Fernet (symmetric authenticated
 encryption). The Fernet key is derived from ``MAOP_KEY`` or
-``MAOP_NOTIFICATION_SECRET`` env var; if neither is set, a per-process
-random key is generated (secrets won't survive restart — acceptable for
-tests, logged as a warning in production).
+``MAOP_NOTIFICATION_SECRET`` env var. If no Fernet key is available,
+:func:`encrypt_secret` raises (fail-closed) instead of falling back to
+plaintext storage — matching the P1 #19 fix applied to ``sso_store``.
 
 Schema (5 tables):
   - notification_channels
@@ -36,6 +36,24 @@ logger = logging.getLogger(__name__)
 # ── Fernet encryption helper ──────────────────────────────────────
 
 
+def _is_valid_fernet_key(key: bytes) -> bool:
+    """Validate a Fernet key without relying on ``Fernet.is_valid_key``.
+
+    ``is_valid_key`` 是 classmethod 但在 cryptography 50 中已被移除；
+    用构造 ``Fernet(key)``（无效 key 抛 ``ValueError``）的等价判断兼容
+    所有版本。
+    """
+    from cryptography.fernet import Fernet
+
+    if hasattr(Fernet, "is_valid_key"):  # cryptography < 50
+        return bool(Fernet.is_valid_key(key))  # type: ignore
+    try:
+        Fernet(key)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 def _get_fernet() -> Any:
     """Return a Fernet instance for secret encryption.
 
@@ -45,19 +63,19 @@ def _get_fernet() -> Any:
       3. ``MAOP_KEY_FILE`` env var (file contents)
       4. Per-process random key (logged warning — secrets won't persist)
 
-    Returns ``None`` if ``cryptography`` is not installed — callers must
-    handle this by storing secrets in plaintext (with a warning).
+    Raises ``ImportError`` if ``cryptography`` is not installed — fail-closed
+    (P1 #19): callers must never fall back to plaintext storage.
     """
-    try:
-        from cryptography.fernet import Fernet
-    except ImportError:
-        return None
+    # Fail-closed (P1 #19，与 sso_store 一致)：cryptography 是
+    # maop-enterprise 的核心依赖，缺失时 ImportError 自然传播，
+    # 不再降级为明文存储。
+    from cryptography.fernet import Fernet
 
     key: bytes | None = None
     secret_env = os.getenv("MAOP_NOTIFICATION_SECRET")
     if secret_env:
         key = secret_env.encode("utf-8")
-        if not Fernet.is_valid_key(key):  # type: ignore  # cryptography stub 未标 classmethod
+        if not _is_valid_fernet_key(key):
             # Derive a valid Fernet key from the env secret via SHA256 → base64
             import base64
             import hashlib
@@ -67,7 +85,7 @@ def _get_fernet() -> Any:
         key_env = os.getenv("MAOP_KEY")
         if key_env:
             key = key_env.encode("utf-8")
-            if not Fernet.is_valid_key(key):  # type: ignore
+            if not _is_valid_fernet_key(key):
                 import base64
                 import hashlib
                 key = base64.urlsafe_b64encode(hashlib.sha256(key).digest())
@@ -75,7 +93,7 @@ def _get_fernet() -> Any:
         key_file = os.getenv("MAOP_KEY_FILE")
         if key_file and Path(key_file).exists():
             key = Path(key_file).read_bytes().strip()
-            if not Fernet.is_valid_key(key):  # type: ignore
+            if not _is_valid_fernet_key(key):
                 import base64
                 import hashlib
                 key = base64.urlsafe_b64encode(hashlib.sha256(key).digest())
@@ -106,14 +124,20 @@ def _fernet() -> Any:
 def encrypt_secret(plaintext: str) -> str:
     """Encrypt a secret string for at-rest storage.
 
-    Returns ``"enc:<ciphertext>"`` if Fernet is available, otherwise
-    ``"plain:<plaintext>"`` (with a one-time warning).
+    Returns ``"enc:<ciphertext>"``. If no Fernet key is available this
+    raises instead of returning ``"plain:<plaintext>"`` — fail-closed
+    (P1 #19): secrets must never be stored in plaintext when encryption
+    is unavailable.
     """
     if not plaintext:
         return ""
     f = _fernet()
     if f is None:
-        return f"plain:{plaintext}"
+        raise RuntimeError(
+            "[notification.store] No Fernet key available — refusing to "
+            "store secret in plaintext (fail-closed). Install cryptography "
+            "or set MAOP_NOTIFICATION_SECRET/MAOP_KEY."
+        )
     return str("enc:" + f.encrypt(plaintext.encode("utf-8")).decode("utf-8"))
 
 

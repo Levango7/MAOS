@@ -37,7 +37,6 @@ from typing import Any
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509 import load_der_x509_certificate
-from defusedxml.lxml import fromstring as _defused_fromstring
 from lxml import etree
 
 from maop.enterprise.sso import (
@@ -49,6 +48,22 @@ from maop.enterprise.sso import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_parse(xml_bytes: bytes):
+    """安全解析 XML（防 XXE）：禁用外部实体、DTD 加载与网络访问。
+
+    使用 lxml 原生 parser 替代 defusedxml.lxml（后者已进入弃用通道，
+    defusedxml.lxml 将在未来版本移除）。禁实体/DTD/网络后与
+    defusedxml 的防护等价（defusedxml 本质是禁用这些特性）。
+    """
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        load_dtd=False,
+        dtd_validation=False,
+    )
+    return etree.fromstring(xml_bytes, parser=parser)
 
 # 尝试导入 xmlsec（G-11：优先使用审计过的库）
 try:
@@ -91,8 +106,13 @@ class SAMLHandler:
         self._config = config
         self._idp_metadata: dict | None = None  # 缓存解析的 metadata
         self._clock_skew_s = CLOCK_SKEW_S
-        # G-06: 记录 SP 发出的 AuthnRequest ID，用于 InResponseTo 校验
-        self._pending_request_ids: set[str] = set()
+        # G-06: 记录 SP 发出的 AuthnRequest ID（id → 发出时间戳），用于
+        # InResponseTo 校验。dict + TTL 清理：旧实现 set 无时间信息，
+        # 长期运行会无界增长；且必须与 Assertion 消费表一样在 handler
+        # 实例内持续积累（由调用方复用同一实例，见 sso.py SSOManager）。
+        self._pending_request_ids: dict[str, float] = {}
+        # AuthnRequest 有效窗口（秒）：超时后丢弃对应 pending id
+        self._request_id_ttl_s: float = 600.0
         # G-11: 标记是否已发出 xmlsec 缺失警告（仅首次 handle_response 调用时发一次）
         self._xmlsec_warning_emitted: bool = False
         # P0: Assertion replay prevention — consumed assertion IDs with timestamps
@@ -119,8 +139,13 @@ class SAMLHandler:
 
         request_id = f"id_{secrets.token_hex(16)}"
         request_xml = self._build_authn_request(request_id)
-        # G-06: 记录 request_id 用于 InResponseTo 校验
-        self._pending_request_ids.add(request_id)
+        # G-06: 记录 request_id 用于 InResponseTo 校验（带时间戳，供 TTL 清理）
+        self._pending_request_ids[request_id] = time.time()
+        # 清理过期 pending（防无界增长）
+        cutoff = time.time() - self._request_id_ttl_s
+        expired = [rid for rid, ts in self._pending_request_ids.items() if ts < cutoff]
+        for rid in expired:
+            self._pending_request_ids.pop(rid, None)
         # SAML HTTP-Redirect binding：DEFLATE（raw, 无 zlib header）→ base64 → URL 编码
         compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
         deflated = compressor.compress(request_xml) + compressor.flush()
@@ -156,7 +181,7 @@ class SAMLHandler:
 
         # 2. 解析 XML（G-11: 使用 defusedxml 防 XXE，审计过的库）
         try:
-            root = _defused_fromstring(response_xml)
+            root = _safe_parse(response_xml)
         except Exception as exc:
             raise SSOError(f"SAMLResponse XML parse failed: {exc}") from exc
 
@@ -178,16 +203,32 @@ class SAMLHandler:
                         + (f" — {msg}" if msg else "")
                     )
 
-        # G-06: InResponseTo 校验 — 防止 replay 攻击
+        # G-06: InResponseTo 校验 — 防止 replay 攻击。
+        # - 响应带 InResponseTo → 必须匹配本实例发出的 pending AuthnRequest
+        #   ID（匹配后消费，一次性使用）；否则视为重放/伪造拒绝。
+        # - 响应缺失 InResponseTo → 若本实例存在 pending 请求（即 SP 确实
+        #   发起过 AuthnRequest），拒绝（IdP 未回执属异常）；若无任何 pending
+        #   （非 SP 发起场景/直接验证第三方响应），告警放行，由 Assertion
+        #   ID 消费表兜底防重放（兼容不规范 IdP）。
         in_response_to = root.get("InResponseTo", "")
         if in_response_to:
-            if self._pending_request_ids and in_response_to not in self._pending_request_ids:
+            if in_response_to not in self._pending_request_ids:
                 raise SSOError(
                     f"SAML Response InResponseTo={in_response_to!r} does not match "
                     f"any pending AuthnRequest ID — possible replay attack"
                 )
             # 消费已使用的 request_id（一次性使用）
-            self._pending_request_ids.discard(in_response_to)
+            self._pending_request_ids.pop(in_response_to, None)
+        elif self._pending_request_ids:
+            raise SSOError(
+                "SAML Response missing InResponseTo while AuthnRequest is "
+                "pending — possible replay/CSRF attack"
+            )
+        else:
+            logger.warning(
+                "[saml] SAML Response without InResponseTo and no pending "
+                "AuthnRequest — relying on Assertion-ID replay protection"
+            )
 
         # 3. 提取 Assertion（Response > Assertion）
         assertion_elem = root.find(f"{{{_SAML_NS}}}Assertion")
@@ -219,6 +260,8 @@ class SAMLHandler:
         # 我们用 signed_elem 的 ID 和位置来验证一致性：
         # - 如果签名覆盖 Assertion，用 signed_elem 替换 assertion_elem（信任签名验证的元素）
         # - 如果签名覆盖 Response，确保 Assertion 是直接子元素
+        # - 签名覆盖任何其他元素 → 拒绝（XSW 特征：签名验证的元素与
+        #   数据提取的元素不是同一元素，必须 fail-closed）
         if signed_elem is not None:
             signed_tag = signed_elem.tag
             if signed_tag == f"{{{_SAML_NS}}}Assertion":
@@ -236,6 +279,12 @@ class SAMLHandler:
                     )
                 # 使用直接子元素，而不是深度查找的元素
                 assertion_elem = direct_assertion
+            else:
+                raise SSOError(
+                    f"XSW attack detected: signature covers unexpected element "
+                    f"'{signed_tag}' — data extraction element differs from "
+                    "the signed element"
+                )
 
         # P0: Validate SubjectConfirmation (Recipient + NotOnOrAfter)
         self._validate_subject_confirmation(assertion_elem)
@@ -364,7 +413,7 @@ class SAMLHandler:
         """
         try:
             # G-11: 使用 defusedxml 防 XXE
-            root = _defused_fromstring(xml_bytes)
+            root = _safe_parse(xml_bytes)
         except Exception as exc:
             raise SSOError(f"IdP metadata XML parse failed: {exc}") from exc
 
@@ -499,7 +548,7 @@ class SAMLHandler:
 
         # 2. 解析 XML（G-11: 使用 defusedxml 防 XXE）
         try:
-            root = _defused_fromstring(response_xml)
+            root = _safe_parse(response_xml)
         except Exception as exc:
             raise SSOError(f"Signature verification: XML parse failed: {exc}") from exc
 
@@ -527,6 +576,23 @@ class SAMLHandler:
         reference_elem = signed_info_elem.find(f"{{{_DS_NS}}}Reference")
         if reference_elem is None:
             raise SSOError("SignedInfo missing Reference element")
+
+        # G-06: Reference URI 必须指向被签名元素（URI="#<ID>" 或为空即
+        # 当前文档）。若不匹配 → 签名覆盖的元素与数据提取的元素不一致，
+        # 属 XSW 特征，拒绝（fail-closed）。
+        ref_uri = (reference_elem.get("URI") or "").strip()
+        signed_id = signed_elem.get("ID", "")
+        if ref_uri:
+            if not signed_id:
+                raise SSOError(
+                    f"Signature Reference URI={ref_uri!r} but signed element "
+                    "has no ID attribute — possible XSW attack"
+                )
+            if ref_uri.lstrip("#") != signed_id:
+                raise SSOError(
+                    f"Signature Reference URI={ref_uri!r} does not match "
+                    f"signed element ID={signed_id!r} — possible XSW attack"
+                )
 
         digest_value_elem = reference_elem.find(f"{{{_DS_NS}}}DigestValue")
         if digest_value_elem is None or not (digest_value_elem.text or "").strip():

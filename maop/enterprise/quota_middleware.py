@@ -3,9 +3,11 @@
 设计原则:
   1. **fail-open** — 任何检查异常(无 tenant_id/无配额/DB 错误)均放行,避免
      配额子系统故障导致整个平台不可用.
-  2. **仅检查不消费** — 中间件只调用 :meth:`QuotaManager.check_quota`,
-     不调用 :meth:`QuotaManager.consume`. 实际消费由业务层显式调用
-     (避免中间件与业务层双重计数).
+  2. **检查 + 扣减（原子）** — 中间件调用 :meth:`QuotaManager.consume`
+     （单条条件 UPDATE 原子检查+累加）。启用本中间件后,业务层**不得**
+     再重复调用 ``consume``,由中间件统一扣减,防止双重计数。
+     （P0 修复：旧实现只 ``check_quota`` 不扣减，配合 QuotaManager 的
+     60s 读取缓存，硬限制在窗口期内恒为陈旧值、形同虚设。）
   3. **路径映射** — 通过 ``path_patterns`` 将 URL 映射到资源标识符
      (e.g. ``/api/agents/*`` → ``api_calls``).
   4. **429 Too Many Requests** — 硬限制触发时返回 429 + ErrorSchema 风格体.
@@ -154,9 +156,14 @@ class QuotaMiddleware(BaseHTTPMiddleware):
         if not tenant_id:
             return cast(Response, await call_next(request))
 
-        # 检查配额 (fail-open: 异常放行)
+        # 检查 + 扣减配额 (fail-open: 异常放行)。P0 修复：旧实现用
+        # check_quota 只读不扣减，配合 QuotaManager 60s 缓存，硬限制在
+        # 窗口期内形同虚设（所有请求读到同一陈旧 used）。改用原子
+        # consume（单条条件 UPDATE 检查+累加），硬限制在中间件层真实生效。
+        # 注意：启用本中间件后，业务层**不得**再重复调用 consume
+        # （否则双重计数）——由本中间件统一扣减。
         try:
-            result = qm.check_quota(tenant_id, resource, amount=1)
+            result = qm.consume(tenant_id, resource, amount=1)
         except Exception as exc:
             logger.warning(
                 "[quota-mw] check failed (fail-open) tenant=%s resource=%s path=%s: %s",

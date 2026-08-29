@@ -28,7 +28,9 @@ from maop.enterprise.notification.models import EventPayload, EventType
 logger = logging.getLogger(__name__)
 
 # Type alias for event handlers. Sync handlers return Any; async handlers
-# return Awaitable[Any]. The bus detects which by inspecting the result.
+# return Awaitable[Any]. The bus detects which by inspecting the callable
+# (``asyncio.iscoroutinefunction``) so sync handlers are offloaded to
+# ``asyncio.to_thread`` instead of blocking the event loop.
 EventHandler = Callable[[EventPayload], Any | Awaitable[Any]]
 
 
@@ -123,11 +125,15 @@ class EventBus:
         return len(handlers)
 
     async def _invoke(self, handler: EventHandler, event: EventPayload) -> Any:
-        """Invoke a handler, wrapping sync callables in to_thread."""
-        result = handler(event)
-        if asyncio.iscoroutine(result):
-            return await result
-        return result
+        """Invoke a handler. Async handlers are awaited directly; plain sync
+        handlers are wrapped in ``asyncio.to_thread`` so they never block the
+        event loop (per module docstring)."""
+        if asyncio.iscoroutinefunction(handler):
+            return await handler(event)
+        # Sync handler → run in a worker thread. We detect async-ness upfront
+        # (instead of calling the handler first and inspecting its return
+        # value) so a sync handler is never invoked twice.
+        return await asyncio.to_thread(handler, event)
 
     # ── Convenience: publish from raw fields ─────────────────────
 

@@ -96,6 +96,9 @@ class NotificationManager:
         self.retry_backoff_s = retry_backoff_s
         self._broadcaster: Broadcaster | None = None
         self._channel_cache: dict[str, BaseChannel] = {}
+        # 后台投递任务集合：持有强引用防止任务在事件循环运行前被 GC 回收
+        # （asyncio 仅对 pending task 持弱引用），任务完成后自动移除。
+        self._delivery_tasks: set = set()
         # Subscribe the manager to the event bus for rule-driven delivery.
         self.event_bus.subscribe("*", self._on_event)
 
@@ -593,7 +596,11 @@ class NotificationManager:
             await self._broadcast({"type": "notification", "data": rec})
 
         # Dispatch delivery in the background (don't block the caller).
-        asyncio.create_task(self._deliver(notif_id, channel_id))
+        # 必须保存 create_task 的返回值：asyncio 只对 pending task 持弱引用，
+        # 若此处不保存，task 可能在事件循环调度前被 GC，投递永远不会执行。
+        task = asyncio.create_task(self._deliver(notif_id, channel_id))
+        self._delivery_tasks.add(task)
+        task.add_done_callback(self._delivery_tasks.discard)
         return response
 
     async def _deliver(self, notif_id: str, channel_id: str) -> None:

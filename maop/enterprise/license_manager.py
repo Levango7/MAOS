@@ -447,9 +447,14 @@ class LicenseManager:
         expires_dt = self._parse_datetime(expires_at)
         now = time.time()
         issued_dt = datetime.now(timezone.utc)
+        # P0 修复: 先生成 license_id 并写入 payload —— 运行时 LicenseValidator
+        # 与 CRL 按 license_id 精确吊销的匹配键。旧实现 payload 无此字段,
+        # CRL 只能退化按 customer 匹配。
+        license_id = str(uuid.uuid4())
         payload: dict[str, Any] = {
             "customer": customer,
             "edition": "enterprise",
+            "license_id": license_id,
             "issued_at": issued_dt.isoformat(),
             "expires_at": expires_dt.isoformat(),
         }
@@ -460,7 +465,6 @@ class LicenseManager:
         if features:
             payload["features"] = list(features)
         license_key = self._sign_payload(payload)
-        license_id = str(uuid.uuid4())
         record = LicenseRecord(
             license_id=license_id,
             customer=customer,
@@ -582,6 +586,8 @@ class LicenseManager:
         payload: dict[str, Any] = {
             "customer": record.customer,
             "edition": record.edition,
+            # P0 修复: 续期保留 license_id（CRL 精确吊销键不变）
+            "license_id": record.license_id,
             "issued_at": issued_dt.isoformat(),
             "expires_at": new_expires_dt.isoformat(),
         }
@@ -613,23 +619,55 @@ class LicenseManager:
     def update_license(self, license_id: str, **kwargs: Any) -> LicenseRecord:
         """Update editable metadata fields (customer, max_users, fingerprint, features, notes).
 
-        Does NOT change the license key or expiry — use ``renew_license`` for that.
+        P0 修复：修改**授权相关字段**（``max_users``/``fingerprint``/
+        ``features``）时同步重签 license key —— 旧实现只改 DB 记录不重签，
+        管理界面显示的授权与运行时 LicenseValidator 从 key 解析出的
+        实际值漂移（改小限制不生效、改大限制客户看不到）。
+        纯展示字段（customer/notes）不重签。
         """
         record = self.get_license(license_id)
         allowed = {"customer", "max_users", "fingerprint", "features", "notes"}
+        # 授权字段变更 → 需要重签（customer 不影响签名内容以外的授权语义，
+        # 但 customer 在 payload 内，修改后 key 与记录仍会不一致 —— 一并重签）
+        signing_fields = {"customer", "max_users", "fingerprint", "features"}
         changed: list[str] = []
+        needs_resign = False
         for k, v in kwargs.items():
             if k in allowed and v is not None:
                 setattr(record, k, v)
                 changed.append(k)
+                if k in signing_fields:
+                    needs_resign = True
         if not changed:
             return record
+        if needs_resign:
+            issued_dt = datetime.now(timezone.utc)
+            payload: dict[str, Any] = {
+                "customer": record.customer,
+                "edition": record.edition,
+                "license_id": record.license_id,
+                "issued_at": issued_dt.isoformat(),
+                "expires_at": (
+                    datetime.fromtimestamp(record.expires_at, timezone.utc).isoformat()
+                ),
+            }
+            if record.max_users is not None:
+                payload["max_users"] = record.max_users
+            if record.fingerprint:
+                payload["fingerprint"] = record.fingerprint
+            if record.features:
+                payload["features"] = list(record.features)
+            record.license_key = self._sign_payload(payload)
+            record.issued_at = time.time()
         record.updated_at = time.time()
         self._save_record(record)
         self._log_audit(
             license_id=license_id,
             action="updated",
-            detail=f"Updated fields: {', '.join(changed)}",
+            detail=(
+                f"Updated fields: {', '.join(changed)}"
+                + ("; license key re-signed" if needs_resign else "")
+            ),
         )
         return record
 

@@ -288,7 +288,13 @@ class HAManager:
         return refreshed  # type: ignore
 
     def release_leadership(self) -> bool:
-        """Release the leader lease (graceful shutdown)."""
+        """Release the leader lease (graceful shutdown).
+
+        本地清理与 Redis 锁释放都在 ``_state_lock`` 内执行，消除 check-then-act
+        竞态：elect_leader 也需要先取得 ``_state_lock`` 才能改 leader_id，
+        因此不会出现「本地已清空 leader_id、Redis 锁仍被持有，期间又被其他
+        线程抢主，随后误释放新持有者的租约」。
+        """
         with self._state_lock:
             if not self._leader_id:
                 return False
@@ -299,9 +305,16 @@ class HAManager:
                 self._nodes[leader_id].role = NodeRole.FOLLOWER
             self._leader_id = ""
             self._fencing_token = 0
-        # Redis 锁释放在 _state_lock 外执行
-        released = redis_lock.release() if redis_lock is not None else True
-        logger.info("[ha] Released leadership")
+            # Redis 锁释放在 _state_lock 内执行（锁操作本身不依赖 _state_lock，
+            # 不会形成环等待）
+            released = True
+            if redis_lock is not None:
+                try:
+                    released = bool(redis_lock.release())
+                except Exception as exc:
+                    logger.warning("[ha] Failed to release leader lock: %s", exc)
+                    released = False
+        logger.info("[ha] Released leadership (released=%s)", released)
         return released
 
     def check_health(self) -> dict[str, Any]:
@@ -337,6 +350,9 @@ class HAManager:
                 "unreachable": unreachable,
                 "leader_id": self._leader_id,
                 "needs_failover": needs_failover,
+                # fencing_token 当前无消费方（预留字段）：仅在持有 leader
+                # 租约时递增、失去租约时清零。上层（如 API 网关/写入代理）
+                # 可在写操作时校验该值，防止 split-brain 下陈旧 leader 写入。
                 "fencing_token": self._fencing_token,
                 "redis_mode": self._redis_mode,
             }
@@ -344,6 +360,31 @@ class HAManager:
     def list_nodes(self) -> list[ClusterNode]:
         with self._state_lock:
             return list(self._nodes.values())
+
+    def prune_stale_nodes(self) -> int:
+        """Remove nodes whose heartbeat has timed out (TTL cleanup).
+
+        节点心跳超过 ``failover_timeout_s`` 视为失联并从集群注册表中移除。
+        若被移除的是当前 leader，则清空 ``leader_id`` / ``fencing_token``，
+        让新一轮选举可以发生。自身节点（``self._node_id``）不会被清理。
+        """
+        with self._state_lock:
+            now = time.time()
+            stale = [
+                nid
+                for nid, node in self._nodes.items()
+                if nid != self._node_id
+                and (now - node.last_heartbeat) > self._config.failover_timeout_s
+            ]
+            for nid in stale:
+                self._nodes.pop(nid, None)
+                if nid == self._leader_id:
+                    self._leader_id = ""
+                    self._fencing_token = 0
+                    logger.warning(
+                        "[ha] Stale leader node=%s pruned — leadership cleared", nid
+                    )
+            return len(stale)
 
     # ── Phase 3.4.4: automatic failover ────────────────────────────
 
@@ -389,6 +430,8 @@ class HAManager:
                     self._health_check_redis()
                 else:
                     self._health_check_memory()
+                # TTL 清理：移除心跳超时的失联节点（防止 _nodes 无限增长）
+                self.prune_stale_nodes()
             except Exception as exc:
                 logger.error("[ha] Health check error: %s", exc)
             # Wait for interval or stop signal
@@ -403,7 +446,6 @@ class HAManager:
         with self._state_lock:
             is_leader = self._leader_id == self._node_id
             has_leader = bool(self._leader_id)
-            auto_failover = self._config.auto_failover
         if is_leader:
             # We are leader: renew the lease
             if not self.renew_leadership():
@@ -412,8 +454,16 @@ class HAManager:
                     self._leader_id = ""
                     self._fencing_token = 0
         else:
-            # We are follower: try to acquire leadership if no leader
-            if not has_leader or auto_failover:
+            # We are a follower. Only attempt election when there is no
+            # leader at all, or when the current leader has gone
+            # unhealthy/unreachable AND auto_failover is enabled
+            # (leader 失联 → 自动转移)。旧条件 `not has_leader or
+            # auto_failover` 在有健康 leader 时仍会每次心跳都尝试抢主，
+            # 造成无谓的租约争抢；改用 check_health 的 needs_failover
+            # （其内部已要求 auto_failover=True 且 leader 状态非 healthy）。
+            health = self.check_health()
+            leader_unreachable = bool(health.get("needs_failover", False))
+            if not has_leader or leader_unreachable:
                 self.elect_leader()
         # Update node statuses
         self.check_health()

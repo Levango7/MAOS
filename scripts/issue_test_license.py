@@ -21,6 +21,7 @@ import base64
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -71,6 +72,8 @@ def issue_license(
     payload: dict[str, object] = {
         "customer": customer,
         "edition": "enterprise",
+        # 与 issue_license.py 保持一致: 携带 license_id 供 CRL 精确吊销
+        "license_id": str(uuid.uuid4()),
         "issued_at": now.isoformat(),
         "expires_at": (now + timedelta(days=days)).isoformat(),
     }

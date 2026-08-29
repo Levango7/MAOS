@@ -3,7 +3,8 @@
 ## 前置条件
 
 - Python 3.10 或更高版本
-- MAOP 个人版 5.1.0+（`pip install maop>=5.1.0`）
+- MAOP 个人版 5.1.0+（`pip install maop-orchestrator>=5.1.0`，PyPI 包名
+  已由 `maop` 改为 `maop-orchestrator`）
 - 有效的 MAOP Enterprise license key
 
 ## 安装步骤
@@ -11,7 +12,7 @@
 ### 1. 安装 MAOP 个人版
 
 ```bash
-pip install maop>=5.1.0
+pip install maop-orchestrator>=5.1.0
 ```
 
 ### 2. 安装 MAOP Enterprise 扩展
@@ -19,13 +20,13 @@ pip install maop>=5.1.0
 #### 方式 A：从私有 wheel 安装（推荐）
 
 ```bash
-pip install maop_enterprise-5.1.0-py3-none-any.whl
+pip install maop_enterprise-5.2.0-py3-none-any.whl
 ```
 
 #### 方式 B：从私有 Git 仓库安装
 
 ```bash
-pip install git+ssh://git@github.com/Levango7/MAOS.git@main
+pip install git+ssh://git@github.com/Levango7/MAOS.git@master
 ```
 
 ### 3. 配置 License Key
@@ -120,4 +121,4 @@ A: 检查：
 A: 联系 MAOP 商务团队获取商业 license key。
 
 ### Q: 安装后 `maop.__version__` 丢失
-A: 这是 namespace package 的已知行为。使用 `importlib.metadata.version("maop")` 获取版本号。
+A: 这是 namespace package 的已知行为。使用 `importlib.metadata.version("maop-orchestrator")` 获取版本号。

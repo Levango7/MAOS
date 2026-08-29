@@ -15,7 +15,7 @@ import urllib.parse
 
 import pytest
 
-from maop.enterprise.sso import SSOConfig, SSOManager, SSOProvider
+from maop.enterprise.sso import SSOConfig, SSOError, SSOManager, SSOProvider
 from maop.enterprise.sso_registry import SSOProviderRegistry
 from maop.enterprise.sso_store import SSOProviderResponse
 
@@ -141,18 +141,19 @@ def test_state_provider_mismatch_rejected(enterprise_edition):
 
 
 def test_sub_not_derived_from_unverified_id_token(oidc_manager):
-    # No sub in claims but an id_token present: external_id must NOT be
-    # a truncated JWT prefix (old behavior) — it degrades to "unknown".
+    # No sub in claims but an id_token present: login MUST be rejected.
+    # Old behavior degraded to "oidc:unknown" — merging every user whose
+    # userinfo lacks sub into one identity (account-takeover risk).
     token_resp = {"id_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.sig"}
-    user = oidc_manager._build_user_from_claims({}, token_resp)
-    assert user.external_id == "oidc:unknown"
+    with pytest.raises(SSOError):
+        oidc_manager._build_user_from_claims({}, token_resp)
 
 
 def test_sub_not_derived_from_id_token_with_mapping(oidc_manager):
     oidc_manager.config.attribute_mapping = {"external_id": "sub"}
     token_resp = {"id_token": "eyJhbGciOiJSUzI1NiJ9.payload.sig"}
-    user = oidc_manager._build_user_from_claims({}, token_resp)
-    assert user.external_id == "oidc:unknown"
+    with pytest.raises(SSOError):
+        oidc_manager._build_user_from_claims({}, token_resp)
 
 
 def test_sub_from_claims_is_used(oidc_manager):

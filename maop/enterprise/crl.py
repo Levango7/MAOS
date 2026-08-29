@@ -266,6 +266,20 @@ class CRLChecker:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if not self._validate_crl(data):
                 return None
+            # P1 修复: 缓存读取路径同样验签 —— 攻击者可回滚旧缓存或写入
+            # 伪造撤销列表, 仅对拉取路径验签存在绕过窗口
+            sig_state = self._verify_crl_signature(data)
+            if sig_state is False:
+                logger.error(
+                    "[crl] Cached CRL signature verification FAILED — "
+                    "rejecting cache (possible tampering)"
+                )
+                return None
+            if sig_state is None:
+                logger.warning(
+                    "[crl] Cached CRL is UNSIGNED — accepting for backward "
+                    "compatibility, but the CRL service should add a signature"
+                )
             return data  # type: ignore
         except Exception as exc:
             logger.debug("[crl] Failed to load cached CRL: %s", exc)
@@ -297,6 +311,19 @@ class CRLChecker:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if not self._validate_crl(data):
                 return None
+            # P1 修复: 离线降级路径同样验签（防缓存回滚/伪造）
+            sig_state = self._verify_crl_signature(data)
+            if sig_state is False:
+                logger.error(
+                    "[crl] Cached CRL signature verification FAILED (offline "
+                    "fallback) — rejecting cache (possible tampering)"
+                )
+                return None
+            if sig_state is None:
+                logger.warning(
+                    "[crl] Cached CRL is UNSIGNED (offline fallback) — "
+                    "accepting for backward compatibility"
+                )
             return data  # type: ignore
         except CRLError:
             raise

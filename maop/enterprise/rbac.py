@@ -314,10 +314,17 @@ class RBACManager:
         return grant.expires_at > _time.time()
 
     def user_roles(self, user_id: str, tenant_id: str = "") -> list[Role]:
+        """返回用户在某租户下的角色。
+
+        租户隔离（P0 修复）：``tenant_id`` 为空时**只匹配全局授权**
+        （``tenant_id=''`` 的 grant），不再合并该用户在所有租户下的角色。
+        旧实现 ``not tenant_id or ...`` 在未显式传租户时会把用户在每个
+        租户的授权全部合并——跨租户权限泄漏的入口。
+        """
         return [
             g.role for g in self._grants
             if g.user_id == user_id
-            and (not tenant_id or g.tenant_id in ("", tenant_id))
+            and g.tenant_id in ("", tenant_id)
             and self._is_active(g)
         ]
 

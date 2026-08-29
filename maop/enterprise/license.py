@@ -502,7 +502,11 @@ class ModuleTamperError(LicenseError):
     """Enterprise module files have been modified after signing."""
 
 
-def verify_module_integrity(*, strict: bool | None = None) -> tuple[bool, str]:
+def verify_module_integrity(
+    *,
+    strict: bool | None = None,
+    manifest_path: Path | None = None,
+) -> tuple[bool, str]:
     """Verify enterprise modules haven't been tampered with.
 
     Reads ``_integrity_manifest.json`` (created at sign-time by
@@ -518,6 +522,10 @@ def verify_module_integrity(*, strict: bool | None = None) -> tuple[bool, str]:
         Either way, the result is logged. When ``strict`` is None, it
         defaults to True in production (``MAOP_ENV=production``) and
         False otherwise.
+    manifest_path : Path | None
+        显式指定 manifest 文件路径（测试隔离用）。None 时使用打包在
+        ``maop/enterprise/_integrity_manifest.json`` 的默认路径。
+        模块文件的哈希基准始终是本包实际目录，不随 manifest 位置漂移。
 
     Returns
     -------
@@ -570,12 +578,20 @@ def verify_module_integrity(*, strict: bool | None = None) -> tuple[bool, str]:
             raise ModuleTamperError(msg)
         return False, reason
 
-    if not _MANIFEST_PATH.exists():
-        return _fail(f"manifest not found: {_MANIFEST_PATH}")
+    manifest_file = manifest_path or _MANIFEST_PATH
+    if not manifest_file.exists():
+        # UX 修复: 缺失 manifest 时给出可执行的恢复指引（此前只报路径）
+        logger.warning(
+            "[integrity] Integrity manifest not found at %s — run "
+            "`python scripts/sign_enterprise_modules.py --key <signing-key>` "
+            "to generate it (release flow must sign with the production key).",
+            manifest_file,
+        )
+        return _fail(f"manifest not found: {manifest_file}")
 
     try:
         import json as _json
-        manifest = _json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+        manifest = _json.loads(manifest_file.read_text(encoding="utf-8"))
     except Exception as exc:
         return _fail(f"manifest unreadable: {exc}", exc)
 
@@ -618,7 +634,10 @@ def verify_module_integrity(*, strict: bool | None = None) -> tuple[bool, str]:
     # 2. Hash-check each declared module
     import hashlib as _hashlib
 
-    repo_root = _MANIFEST_PATH.parent  # maop/enterprise/
+    # 模块根固定为本模块所在目录（maop/enterprise/）——不随 manifest
+    # 位置漂移，使测试可将 manifest 隔离到 tmp 路径（此前 repo_root 取
+    # _MANIFEST_PATH.parent，测试写 tmp manifest 会导致模块文件全缺失）。
+    repo_root = Path(__file__).parent
     tampered: list[str] = []
     for rel_filename, expected_hash in files.items():
         target = repo_root / rel_filename.replace("maop/enterprise/", "")

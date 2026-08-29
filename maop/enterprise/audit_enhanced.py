@@ -41,6 +41,9 @@ from maop.enterprise.audit import AuditEvent, AuditSeverity
 
 logger = logging.getLogger(__name__)
 
+#: 同一规则最小告警间隔（秒）—— 防止阈值规则持续命中时的告警风暴
+ALERT_MIN_INTERVAL_S: float = 60.0
+
 
 # ── Enums ─────────────────────────────────────────────────────────
 
@@ -232,6 +235,10 @@ class AuditAlertEngine:
         # Sliding-window state for threshold/anomaly rules.
         # _window[rule_id] = deque[(timestamp, event_id)]
         self._window: dict[str, deque[tuple[float, str]]] = defaultdict(deque)
+        # P0 修复：告警去重 —— 同一规则在窗口内只生成一条告警，防止
+        # 阈值规则在 count 持续达标时对每个后续事件都触发（告警风暴）。
+        # _last_alert_ts[rule_id] = 上次告警时间戳
+        self._last_alert_ts: dict[str, float] = {}
         # Load persisted rules on init.
         self._load_rules_from_pg()
 
@@ -470,6 +477,13 @@ class AuditAlertEngine:
         )
 
     def _record_alert(self, alert: AuditAlert) -> None:
+        # P0 修复：去重 —— 同一规则在 60s 内只记录/广播一条告警，
+        # 防止阈值规则持续达标时的告警风暴（规则命中 ≠ 每条都发）。
+        now = time.time()
+        last = self._last_alert_ts.get(alert.rule_id, 0.0)
+        if now - last < ALERT_MIN_INTERVAL_S:
+            return
+        self._last_alert_ts[alert.rule_id] = now
         self._alerts.append(alert)
         if self._pg:
             try:

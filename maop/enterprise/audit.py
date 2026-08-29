@@ -179,8 +179,13 @@ class SqliteAuditStore:
         if not self._ok:
             return
         with self._lock, self._connect() as conn:
+            # P0 修复：INSERT OR REPLACE → INSERT OR IGNORE。审计日志是
+            # 合规证据链，同一 event_id 不得被覆盖改写（旧实现用 REPLACE
+            # 允许以相同 event_id 覆盖历史记录，破坏"不可变日志"承诺）。
+            # event_id 为 UUID 随机生成，冲突概率可忽略；发生冲突宁可
+            # 丢弃本次也不覆盖已有证据。
             conn.execute(
-                """INSERT OR REPLACE INTO audit_events
+                """INSERT OR IGNORE INTO audit_events
                       (event_id, timestamp, action, severity, actor, tenant_id,
                        resource, detail, result, ip_address, user_agent, metadata,
                        risk_level, category, tags)
@@ -282,12 +287,16 @@ class EnterpriseAuditLogger:
     保证 ``MAOP_DATA_DIR`` 可写以启用 SQLite 兜底。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, alert_engine: Any = None) -> None:
         require_feature(FeatureFlag.AUDIT_LOG)
         self._events: list[AuditEvent] = []
         self._max_events: int = 100000
         self._pg: PgAuditStore | None = None
         self._sqlite: SqliteAuditStore | None = None
+        # P0 修复：可选注入告警引擎（audit_enhanced.AuditAlertEngine）。
+        # 此前该引擎全仓库零调用点（死代码），规则永不触发；现在 log()
+        # 每条事件都会送入引擎评估。不注入则保持原有行为。
+        self._alert_engine: Any = alert_engine
         try:
             from maop.enterprise.pg_persist import PgAuditStore
             pg = PgAuditStore()
@@ -359,6 +368,12 @@ class EnterpriseAuditLogger:
                 self._sqlite.save_event(event.model_dump())
             except Exception as exc:
                 logger.warning("[audit] SQLite save failed (in-memory only): %s", exc)
+        # P0 修复：告警引擎接线 —— 事件评估失败不阻断审计主流程
+        if self._alert_engine is not None:
+            try:
+                self._alert_engine.evaluate_event(event)
+            except Exception as exc:
+                logger.warning("[audit] alert engine evaluation failed: %s", exc)
         if severity == AuditSeverity.CRITICAL:
             logger.critical("[audit] %s actor=%s tenant=%s resource=%s result=%s",
                             action.value, actor, tenant_id, resource, result)
@@ -381,6 +396,8 @@ class EnterpriseAuditLogger:
         resource: str = "",
         result: str = "",
     ) -> list[AuditEvent]:
+        # P0 修复：tags 过滤在所有后端统一生效（旧实现只在内存分支
+        # 过滤，PG/SQLite 分支静默忽略 tags 参数 → 返回未过滤结果）。
         if self._pg and self._pg.available:
             rows = self._pg.query_events(
                 actor=actor, tenant_id=tenant_id,
@@ -391,7 +408,12 @@ class EnterpriseAuditLogger:
                 category=category,
                 resource=resource, result=result,
             )
-            return [AuditEvent(**_coerce_event_dict(r)) for r in rows]
+            result_list = [AuditEvent(**_coerce_event_dict(r)) for r in rows]
+            if tags:
+                result_list = [
+                    e for e in result_list if all(t in e.tags for t in tags)
+                ]
+            return result_list
         if self._sqlite and self._sqlite.available:
             rows = self._sqlite.query_events(
                 actor=actor, tenant_id=tenant_id,
@@ -402,7 +424,12 @@ class EnterpriseAuditLogger:
                 category=category,
                 resource=resource, result=result,
             )
-            return [AuditEvent(**_coerce_event_dict(r)) for r in rows]
+            result_list = [AuditEvent(**_coerce_event_dict(r)) for r in rows]
+            if tags:
+                result_list = [
+                    e for e in result_list if all(t in e.tags for t in tags)
+                ]
+            return result_list
         result_list = self._events
         if actor:
             result_list = [e for e in result_list if e.actor == actor]

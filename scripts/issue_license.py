@@ -33,6 +33,7 @@ import base64
 import json
 import os
 import sys
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -151,6 +152,10 @@ def issue_license(
     payload: dict[str, object] = {
         "customer": customer,
         "edition": _LICENSE_EDITION,
+        # P0 修复: 每个 license 携带唯一 license_id —— 运行时 LicenseValidator
+        # 与 CRL 按 license_id 精确吊销的匹配键。旧实现无此字段, CRL 只能
+        # 退化为按 customer 宽松匹配（客户改名即失效）。
+        "license_id": str(uuid.uuid4()),
         "issued_at": now.isoformat(),
         "expires_at": (now + timedelta(days=days)).isoformat(),
     }
@@ -229,8 +234,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--key",
-        default="scripts/test_signing_key.pem",
-        help="Private key path (relative to repo root or absolute)",
+        default=None,
+        help=(
+            "Private key path (required for issuance; relative to repo root "
+            "or absolute). 生产签发必须显式提供生产私钥 —— 旧版本默认 "
+            "scripts/test_signing_key.pem 会让运维静默产出用测试密钥签的 "
+            "无效 license。"
+        ),
+    )
+    parser.add_argument(
+        "--allow-test-key",
+        action="store_true",
+        help="允许使用 scripts/test_signing_key.pem 等测试私钥签发（仅本地验证用，生产禁止）",
     )
     parser.add_argument(
         "--write",
@@ -243,6 +258,11 @@ def main() -> None:
         default=True,
         help="Print license to stdout (default: on)",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="不向 stdout 输出 license（配合 --write 仅落盘；与 --stdout 互斥）",
+    )
     args = parser.parse_args()
 
     if args.gen_keys:
@@ -254,10 +274,27 @@ def main() -> None:
     if not args.customer:
         parser.error("--customer is required for license issuance")
 
+    # P0 修复: --key 必填。旧实现默认测试私钥, 生产签发会静默产出
+    # 用测试密钥签名、生产公钥无法验证的 license（方向反了）。
+    if not args.key:
+        parser.error("--key is required for license issuance")
+    if args.quiet:
+        args.stdout = False
+
     repo_root = Path(__file__).resolve().parent.parent
     key_path = Path(args.key)
     if not key_path.is_absolute():
         key_path = repo_root / key_path
+
+    # 拒绝测试密钥用于签发（除非显式 --allow-test-key）
+    if not args.allow_test_key and "test_signing_key" in str(key_path).lower():
+        print(
+            "ERROR: refusing to sign with the test key (scripts/test_signing_key.pem). "
+            "Provide the production private key via --key, or pass --allow-test-key "
+            "for local testing only.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     features_list = _parse_features(args.features)
 

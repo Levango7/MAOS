@@ -28,13 +28,26 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # Locate the MAOP main package so maop.config / maop.core are importable.
-# Try: env override → sibling repo → known absolute path.
+# Try: env override (MAOP_REPO_PATH) → editable-installed distribution →
+# sibling repo (../MAOP/py). 不再硬编码开发者机器绝对路径（旧实现写了
+# F:\\Nexus\\MAOP\\py，换机器/CI 即失效）。
 _maop_candidates: list[Path] = []
 _env_maop = os.getenv("MAOP_REPO_PATH")
 if _env_maop:
     _maop_candidates.append(Path(_env_maop))
+# editable install 的主包（pip install -e maop-base/py 后 importlib 可解析）
+try:
+    import importlib.util as _ilu
+    _spec = _ilu.find_spec("maop")
+    if _spec and _spec.submodule_search_locations:
+        for _loc in _spec.submodule_search_locations:
+            _p = Path(_loc)
+            if (_p / "config" / "edition.py").exists():
+                _maop_candidates.append(_p.parent)
+                break
+except Exception:
+    pass
 _maop_candidates.append(REPO_ROOT.parent / "MAOP" / "py")  # ../MAOP/py
-_maop_candidates.append(Path(r"F:\Nexus\MAOP\py"))          # absolute fallback
 
 for _candidate in _maop_candidates:
     if (_candidate / "maop" / "config" / "edition.py").exists():

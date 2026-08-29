@@ -207,9 +207,12 @@ class QuotaManager:
         """创建 ``tenant_quotas`` / ``tenant_usage`` / ``quota_alerts`` 表.
 
         ``tenant_usage`` 与 :mod:`maop.enterprise.pg_persist` 中的同名表
-        保持列兼容(扩展 ``tokens_today`` / ``cost_today`` / ``last_reset_at``).
-        使用 ``CREATE TABLE IF NOT EXISTS`` + ``ALTER TABLE ADD COLUMN``
-        (忽略已存在列)实现幂等迁移.
+        语义不同（此处为 SQLite 按 (tenant, resource, period_key) 计量的
+        配额用量，pg_persist 为 PG 上租户的汇总列）——两者不互通，属
+        不同存储域的独立数据，引用时注意区分。
+        使用 ``CREATE TABLE IF NOT EXISTS`` 实现幂等建表（历史 docstring
+        曾声称有 ALTER TABLE ADD COLUMN 迁移，实际没有——本表结构自
+        引入起未变过，仅建表幂等即可）。
         """
         with sqlite_connect(self._db_path) as conn:
             # tenant_quotas: 每租户/每资源一条配额
@@ -723,36 +726,24 @@ class QuotaManager:
                      amount, tenant_id, resource),
                 )
                 if cur.rowcount == 0:
-                    # 硬限制拒绝
+                    # 硬限制拒绝 —— 先退出事务上下文再记录告警
+                    # （_record_alert 会开启新的写连接，在事务内嵌套
+                    # 写连接可能触发 SQLite 锁冲突/死锁，P0 修复）
                     usage_row = conn.execute(
                         "SELECT used FROM tenant_usage "
                         "WHERE tenant_id = ? AND resource = ? AND period_key = ?",
                         (tenant_id, resource, key),
                     ).fetchone()
-                    used_now = usage_row[0] if usage_row else 0
-                    alert_id = self._record_alert(
-                        tenant_id, resource, "hard_exceeded",
-                        current_value=used_now + amount, limit_value=hard,
-                        severity="critical",
-                        message=(
-                            f"Hard limit exceeded for {resource}: "
-                            f"projected {used_now + amount} > limit {hard}"
-                        ),
-                    )
-                    return QuotaCheckResult(
-                        allowed=False,
-                        reason=(
-                            f"Quota exceeded: tenant={tenant_id} resource={resource} "
-                            f"used={used_now} hard_limit={hard} requested={amount}"
-                        ),
-                        alert_id=alert_id,
-                    )
-                usage_row = conn.execute(
-                    "SELECT used FROM tenant_usage "
-                    "WHERE tenant_id = ? AND resource = ? AND period_key = ?",
-                    (tenant_id, resource, key),
-                ).fetchone()
-                used = usage_row[0] if usage_row else amount
+                    denied_used = usage_row[0] if usage_row else 0
+                    hard_denied = True
+                else:
+                    usage_row = conn.execute(
+                        "SELECT used FROM tenant_usage "
+                        "WHERE tenant_id = ? AND resource = ? AND period_key = ?",
+                        (tenant_id, resource, key),
+                    ).fetchone()
+                    used = usage_row[0] if usage_row else amount
+                    hard_denied = False
         except Exception as exc:
             # fail-open: DB 错误时不阻塞业务
             logger.warning(
@@ -760,6 +751,26 @@ class QuotaManager:
                 tenant_id, resource, exc,
             )
             return QuotaCheckResult(allowed=True, reason="")
+
+        if hard_denied:
+            # 事务已退出，此处可安全开启新写连接记录告警
+            alert_id = self._record_alert(
+                tenant_id, resource, "hard_exceeded",
+                current_value=denied_used + amount, limit_value=hard,
+                severity="critical",
+                message=(
+                    f"Hard limit exceeded for {resource}: "
+                    f"projected {denied_used + amount} > limit {hard}"
+                ),
+            )
+            return QuotaCheckResult(
+                allowed=False,
+                reason=(
+                    f"Quota exceeded: tenant={tenant_id} resource={resource} "
+                    f"used={denied_used} hard_limit={hard} requested={amount}"
+                ),
+                alert_id=alert_id,
+            )
 
         self._cache_invalidate(tenant_id, resource)
 

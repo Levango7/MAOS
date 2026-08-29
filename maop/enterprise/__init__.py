@@ -24,11 +24,14 @@ Submodules:
   - ha.py            High availability
 
 Backend modules:
-  - core/backends_pg.py      PostgreSQL storage (implemented)
-  - core/backends_redis.py   Redis cache/queue/lock (implemented, Phase 3.4)
-  - core/backends_vault.py   HashiCorp Vault secrets (implemented, Phase 3.3)
-  - core/backends_rabbitmq.py RabbitMQ queue (implemented; requires optional pika)
-  - core/backends_distributed.py etcd/Consul KV (implemented; requires optional etcd3)
+  - 以下后端实现位于 **MAOP 主包**（``maop.core.backends.*``，见 MAOP 仓库），
+    本扩展通过 ``maop.enterprise.pg_persist`` 等模块按 FeatureFlag 选择使用：
+      core/backends_pg.py       PostgreSQL storage
+      core/backends_redis.py    Redis cache/queue/lock
+      core/backends_vault.py    HashiCorp Vault secrets
+      core/backends_rabbitmq.py RabbitMQ queue（可选 pika）
+      core/backends_distributed.py etcd/Consul KV（可选 etcd3）
+  - 本包**不包含**上述后端实现（历史 docstring 曾误列为本地模块，已修正）。
 
 Note: ``FeatureFlag.RABBITMQ`` and ``FeatureFlag.ETCD`` are intentionally
 excluded from ``_ENTERPRISE_FEATURES`` in ``config/edition.py`` because

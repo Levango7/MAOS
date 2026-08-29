@@ -145,6 +145,22 @@ class SSOManager:
             from maop.enterprise.sso_session_store import maybe_open_store
             session_store = maybe_open_store()
         self._session_store = session_store
+        # SAML 处理器进程级单例（lazy）：InResponseTo 与 Assertion 重放
+        # 防护依赖 handler 实例内的 pending/consumed 状态——若每次回调新建
+        # handler 则状态表恒空、防护全部失效（v5.2.0 前为死代码，P0 修复）。
+        self._saml_handler: Any | None = None
+
+    def _get_saml_handler_instance(self):
+        """获取（并缓存）进程内唯一的 SAMLHandler 实例。
+
+        重放防护（``_pending_request_ids`` / ``_consumed_assertion_ids``）
+        是 handler 实例内存态，必须跨 authorize/callback 复用同一实例，
+        否则 InResponseTo 校验与 Assertion 重放拦截永远命中不到。
+        """
+        if self._saml_handler is None:
+            SAMLHandler = _get_saml_handler()
+            self._saml_handler = SAMLHandler(self._config)
+        return self._saml_handler
 
     @property
     def config(self) -> SSOConfig:
@@ -164,11 +180,11 @@ class SSOManager:
                 由调用方通过 :func:`generate_pkce_pair` 生成并暂存
                 code_verifier（用于 ``handle_callback``）。
         """
-        # SAML：构造 AuthnRequest 重定向 URL（由 SAMLHandler 实现）
+        # SAML：构造 AuthnRequest 重定向 URL（由 SAMLHandler 实现）。
+        # 复用同一 handler 实例（重放防护状态跨调用保持）。
         if self._config.provider == SSOProvider.SAML:
-            SAMLHandler = _get_saml_handler()
-            handler = SAMLHandler(self._config)
-            return handler.get_authorize_url(state=state)  # type: ignore
+            handler = self._get_saml_handler_instance()
+            return handler.get_authorize_url(state=state)
         if self._config.provider == SSOProvider.OIDC:
             params: dict[str, str] = {
                 "client_id": self._config.client_id,
@@ -364,8 +380,11 @@ class SSOManager:
     def _fetch_userinfo(self, access_token: str) -> dict[str, Any]:
         """GET ``userinfo_url`` with Bearer auth; return parsed claims.
 
-        Non-fatal: returns ``{}`` on any error (logged at warning level)
-        so a broken userinfo endpoint doesn't block login.
+        Fail-closed (P0 修复)：userinfo 获取失败（网络错误/非 JSON/非对象）
+        直接抛 :class:`SSOError` 拒绝登录。旧实现返回 ``{}`` 并降级为
+        ``oidc:unknown`` —— 所有 userinfo 不可用期间登录的用户会映射到
+        同一 external_id，造成身份合并/可致账号接管。由于本实现不验证
+        id_token 签名（无 JWKS），userinfo 是唯一身份依据，失败必须拒绝。
         """
         req = urllib.request.Request(
             self._config.userinfo_url,
@@ -379,10 +398,17 @@ class SSOManager:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 payload = resp.read().decode("utf-8")
             parsed: Any = json.loads(payload)
-            return parsed if isinstance(parsed, dict) else {}
+            if not isinstance(parsed, dict):
+                raise SSOError(
+                    f"userinfo endpoint returned non-object JSON: "
+                    f"{type(parsed).__name__}"
+                )
+            return parsed
+        except SSOError:
+            raise
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
-            logger.warning("[sso] userinfo fetch failed: %s", exc)
-            return {}
+            logger.error("[sso] userinfo fetch failed — login rejected: %s", exc)
+            raise SSOError(f"userinfo fetch failed: {exc}") from exc
 
     def _build_user_from_claims(
         self, claims: dict[str, Any], token_resp: dict[str, Any]
@@ -393,8 +419,9 @@ class SSOManager:
         按映射从 claims 取值；否则使用默认 precedence（向后兼容）。
 
         Claim precedence (first non-empty wins, 默认无映射时):
-          - external_id: ``sub`` | ``user_id``（缺失时为 "unknown"；
-            不再从 id_token 截取——id_token 未验签，不可作为身份依据）
+          - external_id: ``sub`` | ``user_id``（缺失时抛 :class:`SSOError`
+            fail-closed —— 旧实现降级为 "unknown"，会让所有 userinfo 缺失
+            sub 的用户映射到同一 external_id，造成身份合并）
           - email: ``email`` | ``email_verified`` (bool -> "")
           - display_name: ``name`` | ``preferred_username`` | ``nickname``
           - roles: ``roles`` (list) | ``role`` (str|list) | ``groups``
@@ -403,16 +430,21 @@ class SSOManager:
         SECURITY NOTE: id_token signature is NOT verified (no JWKS fetch).
         Identity relies on the userinfo endpoint over TLS + access_token.
         TODO: add JWKS-based id_token signature verification.
+
+        Raises:
+            SSOError: 无法从 claims 确定唯一身份（sub 缺失）。
         """
         now = time.time()
         mapping = self._config.attribute_mapping or {}
 
         if mapping:
             sub = self._claim_first(claims, mapping.get("external_id", "sub")) or ""
-            # P0 fix: 不再从 id_token 截取 sub（id_token 未验签，其头部内容
-            # 不可作为用户标识；缺失时统一降级为 "unknown"）
+            # P0 fix: sub 缺失即拒绝 —— 不降级、不从未验签 id_token 截取
             if not sub:
-                sub = "unknown"
+                raise SSOError(
+                    "OIDC userinfo response missing subject identifier "
+                    f"(claim '{mapping.get('external_id', 'sub')}') — login rejected"
+                )
             email = self._claim_first(claims, mapping.get("email", "email"))
             name = self._claim_first(claims, mapping.get("display_name", "name"))
             roles = self._mapped_roles(claims, mapping)
@@ -435,9 +467,11 @@ class SSOManager:
             or claims.get("user_id")
             or ""
         )
-        # P0 fix: 不再从 id_token 截取 sub（未验签的 JWT 不可作为身份依据）
+        # P0 fix: sub 缺失即拒绝（不降级 "unknown"，见上方 docstring）
         if not sub:
-            sub = "unknown"
+            raise SSOError(
+                "OIDC userinfo response missing 'sub' claim — login rejected"
+            )
 
         email = str(claims.get("email", "") or "")
         name = (
@@ -527,8 +561,8 @@ class SSOManager:
         Raises:
             SSOError: 任何验证失败（fail-closed，绝不返回 stub session）。
         """
-        SAMLHandler = _get_saml_handler()
-        handler = SAMLHandler(self._config)
+        # 复用进程内同一 handler 实例（重放防护状态跨回调保持）
+        handler = self._get_saml_handler_instance()
         session = handler.handle_response(code, relay_state=state)
         self._sessions[session.session_id] = session
         self._persist_session(session)

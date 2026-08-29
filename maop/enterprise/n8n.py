@@ -351,7 +351,23 @@ class N8nClient:
         try:
             resp = client.get("/workflows", params={"limit": limit})
             resp.raise_for_status()
-            return resp.json().get("data", [])  # type: ignore
+            # 兼容 n8n 两种响应形态：{"data": [...]} 与裸 list（新版本）
+            parsed = resp.json()
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                data = parsed.get("data")
+                if isinstance(data, list):
+                    return data
+                # 无 data 键或类型异常 → 明确报错而非 AttributeError
+                raise N8nIntegrationError(
+                    f"n8n /workflows response missing 'data' list: "
+                    f"{str(parsed)[:200]!r}"
+                )
+            raise N8nIntegrationError(
+                f"n8n /workflows returned unexpected JSON type: "
+                f"{type(parsed).__name__}"
+            )
         except httpx.HTTPStatusError as exc:
             raise N8nIntegrationError(
                 f"n8n API returned {exc.response.status_code}: {exc.response.text}"
@@ -410,20 +426,31 @@ def handle_n8n_webhook(
     """
     require_n8n_feature()
 
-    # HMAC 签名校验
+    # HMAC 签名校验 —— fail-closed（P0 修复）：未配置 N8N_WEBHOOK_SECRET
+    # 时默认拒绝所有请求（公网可触达的入向端点不得无鉴权放行）。
+    # 显式设置 N8N_ALLOW_UNSIGNED=1 可放开（本地/内网测试逃生舱，生产禁止）。
     secret = os.getenv("N8N_WEBHOOK_SECRET", "")
+    allow_unsigned = os.getenv("N8N_ALLOW_UNSIGNED", "").strip().lower() in ("1", "true", "yes")
     if secret:
         if raw_body is None or not verify_webhook_signature(raw_body, signature, secret):
             logger.warning("[n8n] Webhook rejected: invalid or missing signature")
             return {"status": "rejected", "error": "Invalid or missing signature"}
-    else:
+    elif allow_unsigned:
         global _webhook_secret_warned
         if not _webhook_secret_warned:
             logger.warning(
-                "[n8n] N8N_WEBHOOK_SECRET not set — webhook signature verification "
-                "disabled. Configure N8N_WEBHOOK_SECRET for production."
+                "[n8n] N8N_WEBHOOK_SECRET not set and N8N_ALLOW_UNSIGNED=1 — "
+                "webhook signature verification DISABLED. Configure "
+                "N8N_WEBHOOK_SECRET for production."
             )
             _webhook_secret_warned = True
+    else:
+        logger.error(
+            "[n8n] Webhook rejected: N8N_WEBHOOK_SECRET not configured — "
+            "refusing unsigned webhook (set N8N_WEBHOOK_SECRET, or "
+            "N8N_ALLOW_UNSIGNED=1 to explicitly disable verification)"
+        )
+        return {"status": "rejected", "error": "Webhook signature verification not configured"}
 
     try:
         webhook = N8nWebhookPayload(**payload)

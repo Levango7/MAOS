@@ -30,8 +30,9 @@ Commercial. See LICENSE file.
 以下限制为当前版本的已知事实，部署前请评估（详见 `docs/security-audit-license.md` 与 CHANGELOG）：
 
 1. **OIDC id_token 签名不验证**：callback 流程不校验 id_token 的 JWT 签名（未集成 JWKS），
-   用户身份依赖 userinfo 端点 + 到 IdP 的 TLS。sub 缺失时 external_id 降级为 `oidc:unknown`，
-   不会从未验签的 id_token 截取。
+   用户身份依赖 userinfo 端点 + 到 IdP 的 TLS。**userinfo 获取失败或缺失 sub 时
+   登录被拒绝（fail-closed）**——不会降级为 `oidc:unknown`（v5.2.0 曾降级
+   unknown，会把多个用户合并为同一身份，属认证缺陷，已改为拒绝登录）。
 2. **SAML 严格验证**：v5.2.0 起强制要求 `Conditions`/`AudienceRestriction`、Success StatusCode、
    SubjectConfirmation 校验与断言重放防护。不符合 SAML2 规范的 IdP 响应会被拒绝。
 3. **CRL 宽松模式离线降级**：默认（非严格）模式下，CRL 服务不可达且无本地缓存时
@@ -47,3 +48,7 @@ Commercial. See LICENSE file.
 7. **SSO 会话 SQLite 后端为单节点**：`sso_session_store.py` 的 SQLite 持久化不支持
    多副本共享，跨副本部署需要共享存储或 Redis 后端（未实现）。
 8. **系统时钟回拨无防护**：license 过期判断依赖本机时钟，无在线时间戳/回拨检测。
+9. **license 吊销依赖 CRL 服务端**：`LicenseManager.revoke_license` 只更新管理端
+   本地状态；要让客户运行实例真正失效，需将吊销条目发布到 `MAOP_CRL_URL`
+   指向的 CRL 服务（license 已携带 `license_id`，CRL 条目含 `license_id`
+   即可精确吊销）。

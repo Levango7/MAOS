@@ -140,13 +140,41 @@ class TenantManager:
             raise KeyError(f"Tenant '{tenant_id}' not found")
         # P1 #23 fix: 字段白名单 —— 旧实现 hasattr/setattr 允许覆写
         # tenant_id/created_at 等身份与审计字段（调用方传什么改什么）。
+        # 类型校验（P0 修复）：status 必须是合法枚举、quota 必须是
+        # TenantQuota（dict 自动转换），否则直接拒绝 —— 旧实现可把
+        # status 设为任意字符串、quota 设为 dict，导致后续访问
+        # tenant.quota.max_* 抛 AttributeError。
         for k, v in kwargs.items():
-            if k in _UPDATABLE_TENANT_FIELDS:
-                setattr(tenant, k, v)
-            else:
+            if k not in _UPDATABLE_TENANT_FIELDS:
                 logger.warning(
                     "[tenant] update_tenant: ignoring non-updatable field %r", k
                 )
+                continue
+            if k == "status":
+                if v is None:
+                    continue
+                if isinstance(v, TenantStatus):
+                    tenant.status = v
+                elif isinstance(v, str) and v in TenantStatus._value2member_map_:
+                    tenant.status = TenantStatus(v)
+                else:
+                    raise ValueError(
+                        f"Invalid tenant status: {v!r} "
+                        f"(expected one of {[s.value for s in TenantStatus]})"
+                    )
+            elif k == "quota":
+                if v is None:
+                    continue
+                if isinstance(v, TenantQuota):
+                    tenant.quota = v
+                elif isinstance(v, dict):
+                    tenant.quota = TenantQuota(**v)
+                else:
+                    raise TypeError(
+                        f"tenant.quota must be TenantQuota or dict, got {type(v).__name__}"
+                    )
+            else:
+                setattr(tenant, k, v)
         tenant.updated_at = time.time()
         if self._pg:
             self._pg.save_tenant(tenant.model_dump())
@@ -195,7 +223,17 @@ class TenantManager:
             "concurrent_tasks": tenant.quota.max_concurrent_tasks,
             "users": tenant.quota.max_users,
         }
-        limit = quota_map.get(resource, 0)
+        if resource not in quota_map:
+            # P0 修复: 未知资源 fail-closed（记录告警并拒绝）。
+            # 旧实现 ``quota_map.get(resource, 0)`` → limit=0 → 恒放行,
+            # 调用方拼错资源名（如 "api_call"）即永久绕过配额。
+            logger.error(
+                "[tenant] check_quota: unknown resource %r for tenant=%s — "
+                "denying (fail-closed). Known resources: %s",
+                resource, tenant_id, sorted(quota_map),
+            )
+            return False
+        limit = quota_map[resource]
         return current < limit if limit > 0 else True
 
     def get_usage(self, tenant_id: str) -> TenantUsage:
