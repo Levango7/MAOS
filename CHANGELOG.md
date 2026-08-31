@@ -6,6 +6,12 @@
 防护、修复商业链路断裂、统一分发产物。测试从 156 增至 164（新增 8 个真实路径
 回归测试），覆盖率 52.03% → 53.40%。
 
+**安装**：GitHub Release
+[v5.2.1-enterprise](https://github.com/Levango7/MAOS/releases/tag/v5.2.1-enterprise)
+附 `maop_enterprise-5.2.1-py3-none-any.whl`（force-include 完整性 manifest，
+仓库自洽）。基础包 `maop-orchestrator` 尚未发 PyPI，需走 GitHub：
+`pip install "maop-orchestrator @ git+https://github.com/Levango7/MAOP.git@master#subdirectory=py"`。
+
 ### Security（死代码激活 / fail-closed）
 
 - **SAML 重放防护激活**（P0）：`SSOManager` 改为进程内复用同一 `SAMLHandler`
@@ -58,11 +64,12 @@
 - **wheel 重建为 5.2.1**（此前 dist/ 是过期的 5.1.0）：含 `cryptography`/
   `httpx` 核心依赖、`sso-saml` extra 修正为 `lxml`+`defusedxml`、含
   `sso_session_store.py` 与 `_integrity_manifest.json`（force-include，
-  生产 strict 模式启动校验依赖）；旧 5.1.0 wheel 保留于 dist/
+  生产 strict 模式启动校验依赖）
 - 完整性 manifest 用打包公钥配对私钥重签（仓库内自洽、校验通过）；
   发布说明：生产发行前必须用生产私钥重新签名 manifest
-- 安装文档修正：包名 `maop` → `maop-orchestrator`、wheel 版本 5.2.0、
-  分支 `@main` → `@master`、FAQ 版本查询包名
+- 安装文档修正：包名 `maop` → `maop-orchestrator`、wheel 版本 5.2.1、
+  FAQ 版本查询包名；安装方式统一为 GitHub Releases 优先（基础包未发
+  PyPI 期间；`v5.2.1-enterprise` Release 已附 wheel）
 - `conftest.py` 移除硬编码 `F:\Nexus\MAOP\py` 绝对路径（改用 env 覆盖 +
   importlib 探测 + 相对探测）
 - 完整性测试重构为 tmp 隔离（不再直接读写/删除仓库内真实 manifest 与模块，
