@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "signed_at": "2026-08-29T20:53:12.760008+00:00",
+  "signed_at": "2026-09-08T05:23:11.644848+00:00",
   "tool": "sign_enterprise_modules.py",
   "files": {
     "maop/enterprise/__init__.py": "bc76afe26d0060bbce0b62469bdff622c81ca6d601c307a937c9519e9de986f9",
-    "maop/enterprise/audit.py": "c5e21794246e865588967b10c2b5589d55f91dfc0ef721abccef29a0b4f7eabb",
+    "maop/enterprise/audit.py": "c4a03a409eb814546080792c76341507d0b1d4a3149c853b771b148bdfea7145",
     "maop/enterprise/audit_enhanced.py": "7ff0f0269dad2558c8fdfcca6f091905afbd67b3bcf6c2fb184966d2aeb2c4b2",
     "maop/enterprise/container.py": "fe40e6f9ab84f32cc6557094dfe6d1971e7ad19993e983bc65c39abce6c3dd74",
     "maop/enterprise/crl.py": "acc2bce204686b2c06398723c0dd5c63b90a2540a7343a9d832c87d25ac5ace5",
@@ -30,5 +30,5 @@
     "maop/enterprise/tenant.py": "60780f3bf73ffc9b982241a51eac91187e0608748faacc2a8ebd6211d353c59e",
     "maop/enterprise/tls_auto.py": "a17949fcf89f0710ce59ba71f9970f76ef743c8bf24836c1145ed4c6f48acfb5"
   },
-  "signature": "srPDNuE0q1n2fQplabVleIMBfjK6NzLAZ7WovqQBtST61QRGMalScQWELqZ0yLujz5Z3NyGihzTaE54aXAXOCA"
+  "signature": "8OEXjCEx6B1Brc704UxKjZZoXFnVC6eKOL-fkz7gTxXEaFYirSH1jQ3o96ISsjrovt66OK65CVwJpjZiQnlCCw"
 }

@@ -35,20 +35,29 @@ def _coerce_event_dict(row: dict[str, Any]) -> dict[str, Any]:
     defaults for missing fields, but the ``action`` / ``severity``
     columns are stored as plain strings and must be valid enum values.
     This helper strips ``None`` values (which Pydantic v2 rejects for
-    enum fields) and coerces ``tags`` from a JSON string when needed.
+    enum fields) and coerces ``tags`` / ``metadata`` from JSON strings
+    when needed (SQLite stores both as JSON text columns).
     """
+    import json
+
     cleaned: dict[str, Any] = {}
     for k, v in row.items():
         if v is None:
             continue
         if k == "tags" and isinstance(v, str):
             try:
-                import json
                 parsed = json.loads(v)
                 if isinstance(parsed, list):
                     v = parsed
             except (json.JSONDecodeError, TypeError):
                 v = []
+        elif k == "metadata" and isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, dict):
+                    v = parsed
+            except (json.JSONDecodeError, TypeError):
+                v = {}
         cleaned[k] = v
     return cleaned
 
