@@ -256,13 +256,27 @@ class RBACManager:
         granted_by: str = "",
         tenant_id: str = "",
         expires_at: float | None = None,
+        _caller_roles: frozenset[Role] | None = None,
     ) -> RoleGrant:
         """Grant a role to a user.
+
+        P1-7 fix: 提权防护 — 授予 ADMIN/SUPERADMIN 角色时，调用者必须拥有
+        SUPERADMIN 角色。通过 ``_caller_roles`` 传入调用方角色集合（HTTP 层
+        从 ``request.state.auth_roles`` 获取）。未传入或不含 SUPERADMIN 时
+        拒绝授予高权限角色（fail-closed），避免 ADMIN 自行授予 SUPERADMIN
+        或任意用户授予 ADMIN 的提权路径。
 
         C8 note: authorization is enforced at the HTTP layer
         (dashboard/routers/rbac.py require_admin). Callers invoking this
         method directly MUST perform their own authorization check.
         """
+        # P1-7 fix: 提权防护 — 授予 ADMIN/SUPERADMIN 必须由 SUPERADMIN 执行
+        if role in (Role.ADMIN, Role.SUPERADMIN):
+            if _caller_roles is None or Role.SUPERADMIN not in _caller_roles:
+                raise PermissionError(
+                    f"Cannot grant {role.value} role: caller lacks SUPERADMIN privilege. "
+                    "Only SUPERADMIN can grant ADMIN or SUPERADMIN roles."
+                )
         import time as _time
         now = _time.time()
         # C8 fix: expires_at was accepted by the model but never settable

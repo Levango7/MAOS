@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -76,6 +77,14 @@ _GRACE_PERIOD_DAYS = 7
 
 # Path to the bundled public key
 _PUBLIC_KEY_PATH = Path(__file__).parent / "keys" / "public_key.pem"
+
+# P1-1 fix: 硬编码的公钥 SHA-256 指纹（防止公钥文件被替换伪造 license）。
+# 该指纹由打包时计算并嵌入；运行时加载公钥后校验，不匹配则拒绝。
+# 测试场景可通过 MAOP_LICENSE_KEY_FP 环境变量覆盖（指向测试密钥的指纹），
+# 或通过 MAOP_LICENSE_KEY_FP_SKIP=1 跳过校验（仅限测试/开发）。
+_DEFAULT_PUBLIC_KEY_FINGERPRINT = (
+    "b3cda1118e725105e1cea47ffb85aabd2e416f7788b2f155106afe5dce9928c7"
+)
 
 
 class LicenseInfo(BaseModel):
@@ -235,7 +244,13 @@ class LicenseValidator:
         self._crl_checker = self._init_crl_checker()
 
     def _load_public_key(self):
-        """Load the Ed25519 public key from PEM file."""
+        """Load the Ed25519 public key from PEM file.
+
+        P1-1 fix: 加载后校验公钥 SHA-256 指纹是否匹配硬编码期望值，
+        防止攻击者替换公钥文件伪造 license。指纹可通过环境变量
+        ``MAOP_LICENSE_KEY_FP`` 覆盖（测试隔离用），或通过
+        ``MAOP_LICENSE_KEY_FP_SKIP=1`` 跳过（仅限测试/开发）。
+        """
         try:
             from cryptography.hazmat.primitives import serialization
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -246,6 +261,10 @@ class LicenseValidator:
                     f"The maop-enterprise package may be corrupted."
                 )
             key_data = self._public_key_path.read_bytes()
+
+            # P1-1 fix: 公钥指纹校验（防止公钥文件被替换）
+            self._verify_public_key_fingerprint(key_data)
+
             public_key = serialization.load_pem_public_key(key_data)
             if not isinstance(public_key, Ed25519PublicKey):
                 raise LicenseError(
@@ -256,6 +275,34 @@ class LicenseValidator:
             raise
         except Exception as exc:
             raise LicenseError(f"Failed to load public key: {exc}") from exc
+
+    @staticmethod
+    def _verify_public_key_fingerprint(key_data: bytes) -> None:
+        """校验公钥 SHA-256 指纹（P1-1 fix）。
+
+        优先级：
+          1. ``MAOP_LICENSE_KEY_FP_SKIP=1`` → 跳过（测试逃生舱口，记录警告）
+          2. ``MAOP_LICENSE_KEY_FP`` 环境变量 → 用其作为期望指纹
+          3. 硬编码 ``_DEFAULT_PUBLIC_KEY_FINGERPRINT`` → 用其作为期望指纹
+
+        不匹配即抛 :class:`LicenseError`（fail-closed），防止公钥被替换后
+        伪造的 license 通过验签。
+        """
+        skip = os.getenv("MAOP_LICENSE_KEY_FP_SKIP", "").strip().lower()
+        if skip in ("1", "true", "yes"):
+            logger.warning(
+                "[license] Public key fingerprint check SKIPPED "
+                "(MAOP_LICENSE_KEY_FP_SKIP set) — do NOT use in production"
+            )
+            return
+        expected_fp = os.getenv("MAOP_LICENSE_KEY_FP", "").strip() or _DEFAULT_PUBLIC_KEY_FINGERPRINT
+        actual_fp = hashlib.sha256(key_data).hexdigest()
+        if actual_fp != expected_fp:
+            raise LicenseError(
+                f"License public key fingerprint mismatch — refusing to load. "
+                f"Expected {expected_fp[:16]}..., got {actual_fp[:16]}... "
+                f"(public key file may have been tampered/replaced)"
+            )
 
     def _init_crl_checker(self):
         """初始化 CRL 检查器（lazy，仅当配置了 MAOP_CRL_URL 时启用）。

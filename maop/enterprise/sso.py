@@ -55,6 +55,16 @@ DEFAULT_ATTRIBUTE_MAPPING: dict[str, Any] = {
     "tenant_id": "tid",
 }
 
+# P1-4 fix: 高危角色黑名单 —— IdP 返回的这些角色一律剔除，防止恶意/被攻陷 IdP
+# 注入高权角色直接接管系统。过滤后无角色则由调用方赋 default_role。
+_DANGEROUS_ROLES: frozenset[str] = frozenset({
+    "admin",
+    "superadmin",
+    "system:admin",
+    "root",
+    "sysadmin",
+})
+
 
 class SSOError(RuntimeError):
     """SSO 相关错误（如未实现的 provider、配置缺失等）。
@@ -93,6 +103,10 @@ class SSOConfig(BaseModel):
     attribute_mapping: dict[str, Any] = Field(default_factory=dict)
     # PRD 3.4: 角色映射（IdP 角色 → 系统角色），可选
     role_mapping: dict[str, str] = Field(default_factory=dict)
+    # P1-2 fix: OIDC JWKS URL（直接配置，优先于 discovery 自动发现）。
+    # 配置后 id_token 签名将用 JWKS 公钥严格验证；未配置时从 issuer_url
+    # + /.well-known/openid-configuration 自动发现 jwks_uri。
+    oidc_jwks_url: str = ""
 
 
 class SSOUser(BaseModel):
@@ -264,6 +278,18 @@ class SSOManager:
             )
             expires_in = 3600.0
 
+        # P1-2 fix: 验证 id_token 签名（JWKS）—— fail-closed。
+        # id_token 存在时必须验签，验签失败/JWKS 获取失败即拒绝登录。
+        # id_token 缺失时继续依赖 userinfo（保持向后兼容，部分 provider 不返回 id_token）。
+        id_token = str(token_resp.get("id_token", ""))
+        if id_token:
+            self._verify_id_token(id_token)
+        else:
+            logger.warning(
+                "[sso] OIDC token response missing id_token — relying on userinfo "
+                "endpoint alone (no JWT signature verification possible)"
+            )
+
         now = time.time()
 
         user_claims: dict[str, Any] = {}
@@ -410,6 +436,148 @@ class SSOManager:
             logger.error("[sso] userinfo fetch failed — login rejected: %s", exc)
             raise SSOError(f"userinfo fetch failed: {exc}") from exc
 
+    # ── P1-2 fix: id_token JWKS 签名验证 ──────────────────────────────
+
+    def _fetch_jwks(self) -> dict[str, Any]:
+        """获取 OIDC JWKS（JSON Web Key Set）。
+
+        优先级：
+          1. ``SSOConfig.oidc_jwks_url`` 直接配置的 JWKS URL
+          2. 从 ``SSOConfig.issuer_url`` + ``/.well-known/openid-configuration``
+             发现 jwks_uri 后获取
+
+        Fail-closed：任何获取失败（网络/非 JSON/无 keys）抛 :class:`SSOError`。
+        JWKS 不缓存（每次登录重新获取，避免使用过期密钥；IdP 密钥轮换安全）。
+        """
+        jwks_url = self._config.oidc_jwks_url
+        if not jwks_url:
+            # 从 issuer 自动发现 jwks_uri
+            issuer = self._config.issuer_url.rstrip("/")
+            if not issuer:
+                raise SSOError(
+                    "Cannot verify id_token: neither oidc_jwks_url nor issuer_url "
+                    "is configured — JWKS unavailable"
+                )
+            discovery_url = f"{issuer}/.well-known/openid-configuration"
+            try:
+                req = urllib.request.Request(
+                    discovery_url,
+                    method="GET",
+                    headers={"Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    discovery = json.loads(resp.read().decode("utf-8"))
+                jwks_url = str(discovery.get("jwks_uri", ""))
+            except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+                raise SSOError(
+                    f"OIDC discovery document fetch failed from {discovery_url}: {exc}"
+                ) from exc
+            if not jwks_url:
+                raise SSOError(
+                    "OIDC discovery document missing jwks_uri — cannot verify id_token"
+                )
+        try:
+            req = urllib.request.Request(
+                jwks_url, method="GET", headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                jwks = json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, json.JSONDecodeError, OSError) as exc:
+            raise SSOError(f"JWKS fetch failed from {jwks_url}: {exc}") from exc
+        if not isinstance(jwks, dict) or not jwks.get("keys"):
+            raise SSOError(f"JWKS response malformed (no 'keys' array): {jwks_url}")
+        return jwks
+
+    def _verify_id_token(self, id_token: str) -> dict[str, Any]:
+        """验证 OIDC id_token 的签名与标准声明（P1-2 fix）。
+
+        使用 JWKS 公钥严格验签（PyJWT）。Fail-closed：
+          - PyJWT 不可用 → 拒绝（不降级到不验签）
+          - JWKS 获取失败 → 拒绝
+          - 签名无效/过期/iss 不匹配/aud 不匹配 → 拒绝
+
+        Returns:
+            id_token 的解码 payload（供上层使用，当前仅做验签）。
+
+        Raises:
+            SSOError: 任何验签失败。
+        """
+        try:
+            import jwt  # PyJWT
+        except ImportError as exc:
+            raise SSOError(
+                "Cannot verify id_token signature: PyJWT not installed "
+                "(pip install PyJWT). Refusing to accept unverified id_token."
+            ) from exc
+
+        # 1. 获取 JWKS
+        jwks = self._fetch_jwks()
+
+        # 2. 用 PyJWKClient 从 JWKS 选取匹配 id_token kid 的签名密钥
+        try:
+            from jwt import PyJWKClient
+            jwks_uri = self._config.oidc_jwks_url or ""
+            if not jwks_uri:
+                # PyJWKClient 需要 URI；用 issuer 构造（与 _fetch_jwks 一致）
+                issuer = self._config.issuer_url.rstrip("/")
+                jwks_uri = f"{issuer}/.well-known/openid-configuration"
+            # 直接从已获取的 jwks 构造 signing key，避免 PyJWKClient 二次网络请求
+            signing_key = self._select_jwk_for_token(jwt, jwks, id_token)
+        except SSOError:
+            raise
+        except Exception as exc:
+            raise SSOError(f"id_token signing key selection failed: {exc}") from exc
+
+        # 3. 验签 + 标准声明校验
+        decode_kwargs: dict[str, Any] = {"algorithms": ["RS256", "ES256", "EdDSA"]}
+        if self._config.client_id:
+            decode_kwargs["audience"] = self._config.client_id
+        if self._config.issuer_url:
+            decode_kwargs["issuer"] = self._config.issuer_url
+        try:
+            payload = jwt.decode(
+                id_token,
+                signing_key.key if hasattr(signing_key, "key") else signing_key,
+                **decode_kwargs,
+            )
+        except Exception as exc:
+            raise SSOError(f"id_token signature/claims verification failed: {exc}") from exc
+
+        logger.debug("[sso] id_token verified (sub=%s)", payload.get("sub"))
+        return payload
+
+    @staticmethod
+    def _select_jwk_for_token(jwt_module: Any, jwks: dict[str, Any], id_token: str) -> Any:
+        """从 JWKS 选取匹配 id_token header.kid 的密钥。
+
+        PyJWT 的 PyJWKClient 需要网络 URI；此处直接从已获取的 jwks dict
+        构造 PyJWK 对象，避免二次请求并支持 oidc_jwks_url 未配置的场景。
+        """
+        try:
+            unverified_header = jwt_module.get_unverified_header(id_token)
+        except Exception as exc:
+            raise SSOError(f"id_token header decode failed: {exc}") from exc
+        kid = unverified_header.get("kid", "")
+        alg = unverified_header.get("alg", "")
+        for key in jwks.get("keys", []):
+            if kid and key.get("kid", "") != kid:
+                continue
+            if alg and key.get("alg", "") and key.get("alg", "") != alg:
+                continue
+            try:
+                from jwt import PyJWK
+                return PyJWK(key)
+            except Exception:
+                # 某些 PyJWT 版本 PyJWK 构造方式不同，尝试另一种
+                try:
+                    from jwt.algorithms import RSAAlgorithm
+                    return RSAAlgorithm.from_jwk(key)
+                except Exception as exc:
+                    raise SSOError(f"Failed to construct signing key from JWK: {exc}") from exc
+        raise SSOError(
+            f"No JWKS key matches id_token header (kid={kid!r}, alg={alg!r})"
+        )
+
     def _build_user_from_claims(
         self, claims: dict[str, Any], token_resp: dict[str, Any]
     ) -> SSOUser:
@@ -427,9 +595,9 @@ class SSOManager:
           - roles: ``roles`` (list) | ``role`` (str|list) | ``groups``
           - tenant_id: ``tenant_id`` | ``tid``
 
-        SECURITY NOTE: id_token signature is NOT verified (no JWKS fetch).
-        Identity relies on the userinfo endpoint over TLS + access_token.
-        TODO: add JWKS-based id_token signature verification.
+        SECURITY NOTE: id_token signature is verified via JWKS when present
+        (P1-2 fix, see ``_verify_id_token``). Identity additionally relies on
+        the userinfo endpoint over TLS + access_token.
 
         Raises:
             SSOError: 无法从 claims 确定唯一身份（sub 缺失）。
@@ -517,7 +685,10 @@ class SSOManager:
         claims: dict[str, Any],
         mapping: dict[str, Any],
     ) -> list[str]:
-        """按映射从 claims 提取角色，再按 role_mapping 转换为系统角色。"""
+        """按映射从 claims 提取角色，再按 role_mapping 转换为系统角色。
+
+        P1-4 fix: 剔除高危角色（admin/superadmin 等），防止 IdP 注入高权角色。
+        """
         roles_key = mapping.get("roles", "groups")
         raw: list[str] = []
         v = claims.get(roles_key)
@@ -527,8 +698,17 @@ class SSOManager:
             raw = [v.strip()]
         role_map = self._config.role_mapping or {}
         if not role_map:
-            return raw
-        return [role_map.get(r, r) for r in raw]
+            mapped = raw
+        else:
+            mapped = [role_map.get(r, r) for r in raw]
+        # P1-4 fix: 过滤高危角色
+        filtered = [r for r in mapped if r not in _DANGEROUS_ROLES]
+        if len(filtered) != len(mapped):
+            dropped = sorted(set(mapped) - set(filtered))
+            logger.warning(
+                "[sso] Dropped dangerous roles from IdP claims: %s", dropped
+            )
+        return filtered
 
     def _roles_from_claims(self, claims: dict[str, Any]) -> list[str]:
         """Extract roles from common claim shapes.
@@ -536,14 +716,26 @@ class SSOManager:
         Supports ``roles`` (list), ``role`` (str or list), and ``groups``
         (list). Returns an empty list if none are present (caller applies
         the default role).
+
+        P1-4 fix: 剔除高危角色（admin/superadmin 等），防止 IdP 注入高权角色。
         """
+        raw: list[str] = []
         for key in ("roles", "role", "groups"):
             v = claims.get(key)
             if isinstance(v, list) and v:
-                return [str(r) for r in v]
+                raw = [str(r) for r in v]
+                break
             if isinstance(v, str) and v.strip():
-                return [v.strip()]
-        return []
+                raw = [v.strip()]
+                break
+        # P1-4 fix: 过滤高危角色
+        filtered = [r for r in raw if r not in _DANGEROUS_ROLES]
+        if len(filtered) != len(raw):
+            dropped = sorted(set(raw) - set(filtered))
+            logger.warning(
+                "[sso] Dropped dangerous roles from IdP claims: %s", dropped
+            )
+        return filtered
 
     def _handle_saml_callback(self, code: str, state: str = "") -> SSOSession:
         """处理 SAML 回调。

@@ -65,14 +65,19 @@ def _safe_parse(xml_bytes: bytes):
     )
     return etree.fromstring(xml_bytes, parser=parser)
 
-# 尝试导入 xmlsec（G-11：优先使用审计过的库）
+# P1-6 fix: xmlsec 是 SAML XML 签名验证的审计过的库；不可用时拒绝验证而非
+# 回退到自研实现（自研签名验证存在 XSW/c14n 等微妙缺陷，不可用于生产 SSO）。
 try:
     import xmlsec  # noqa: F401
     _HAS_XMLSEC = True
     logger.debug("[saml] xmlsec library available — using audited signature verification")
 except ImportError:
     _HAS_XMLSEC = False
-    logger.info("[saml] xmlsec not installed — falling back to self-verified signature")
+    logger.error(
+        "[saml] xmlsec not installed — SAML signature verification DISABLED. "
+        "Install xmlsec (pip install xmlsec) for production SSO. "
+        "SAML responses will be REJECTED until xmlsec is available."
+    )
 
 # SAML / XMLDSig / Metadata 命名空间
 NS = {
@@ -93,6 +98,16 @@ CLOCK_SKEW_S = 60
 
 # SAML session 默认有效期（8 小时）
 _DEFAULT_SESSION_TTL_S = 28800
+
+# P1-4 fix: 高危角色黑名单 —— IdP 返回的这些角色一律剔除，防止恶意/被攻陷 IdP
+# 注入高权角色直接接管系统。与 sso.py 的 _DANGEROUS_ROLES 保持一致。
+_DANGEROUS_ROLES: frozenset[str] = frozenset({
+    "admin",
+    "superadmin",
+    "system:admin",
+    "root",
+    "sysadmin",
+})
 
 
 class SAMLHandler:
@@ -382,7 +397,11 @@ class SAMLHandler:
         return cert  # type: ignore
 
     def _fetch_idp_metadata(self) -> bytes:
-        """从 config.saml_metadata_url 获取 IdP metadata XML。"""
+        """从 config.saml_metadata_url 获取 IdP metadata XML。
+
+        P1-5 fix: 获取后验证 metadata XML 签名（若已签名）。xmlsec 可用时
+        用其验签；不可用时仅依赖 TLS 传输层保护并记录警告。
+        """
         url = self._config.saml_metadata_url
         if not url:
             raise SSOError(
@@ -394,11 +413,100 @@ class SAMLHandler:
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                return resp.read()  # type: ignore
+                raw_xml = resp.read()  # type: ignore
         except urllib.error.URLError as exc:
             raise SSOError(
                 f"Failed to fetch IdP metadata from {url}: {exc.reason}"
             ) from exc
+
+        # P1-5 fix: 验证 metadata 签名
+        if _HAS_XMLSEC:
+            self._verify_metadata_signature(raw_xml, url)
+        else:
+            logger.warning(
+                "[saml] IdP metadata signature NOT verified — xmlsec not installed. "
+                "Metadata obtained over TLS only (url=%s). Install xmlsec for full "
+                "metadata signature verification.",
+                url,
+            )
+        return raw_xml
+
+    def _verify_metadata_signature(self, xml_bytes: bytes, source_url: str = "") -> None:
+        """验证 IdP metadata 的 XML 签名（P1-5 fix）。
+
+        用 xmlsec 验证 metadata 的 enveloped signature。metadata 签名通常用
+        IdP 自己的证书（在 metadata KeyDescriptor 中），此处先信任 TLS 来源
+        再验证签名确保完整性。
+
+        - metadata 未签名 → 记录警告（签名可选但建议），不拒绝
+        - metadata 已签名但验签失败 → 抛 SSOError（fail-closed）
+        - xmlsec API 错误 → 抛 SSOError（fail-closed）
+
+        Args:
+            xml_bytes: metadata XML 原始字节
+            source_url: metadata 来源 URL（仅用于日志）
+        """
+        try:
+            import xmlsec
+        except ImportError as exc:
+            raise SSOError(
+                "xmlsec not available for metadata signature verification"
+            ) from exc
+
+        try:
+            root = _safe_parse(xml_bytes)
+        except Exception as exc:
+            raise SSOError(f"metadata signature verification: XML parse failed: {exc}") from exc
+
+        # 查找 Signature 元素
+        sig_node = root.find(f".//{{{_DS_NS}}}Signature")
+        if sig_node is None:
+            # metadata 未签名 —— 某些 IdP 不签 metadata。记录警告，不拒绝
+            # （签名可选；完整性依赖 TLS 传输层 + 配置的信任锚）。
+            logger.warning(
+                "[saml] IdP metadata is NOT signed — cannot verify integrity "
+                "via signature (url=%s). Ensure metadata obtained over trusted "
+                "TLS channel and URL configured out-of-band.",
+                source_url,
+            )
+            return
+
+        # 从 metadata 提取 X509Certificate 用于验证签名
+        cert_b64 = ""
+        for kd in root.iter(f"{{{_MD_NS}}}KeyDescriptor"):
+            if kd.get("use", "signing") != "signing":
+                continue
+            cert_elem = kd.find(f".//{{{_DS_NS}}}X509Certificate")
+            if cert_elem is not None and cert_elem.text:
+                cert_b64 = "".join(cert_elem.text.split())
+                break
+        if not cert_b64:
+            for cert_elem in root.iter(f"{{{_DS_NS}}}X509Certificate"):
+                if cert_elem.text:
+                    cert_b64 = "".join(cert_elem.text.split())
+                    break
+        if not cert_b64:
+            raise SSOError(
+                "IdP metadata is signed but contains no X509Certificate — "
+                "cannot verify signature"
+            )
+
+        # 构造 PEM 证书并创建 xmlsec Key
+        try:
+            cert_pem = (
+                b"-----BEGIN CERTIFICATE-----\n"
+                + base64.b64encode(base64.b64decode(cert_b64))
+                + b"\n-----END CERTIFICATE-----\n"
+            )
+            key = xmlsec.Key.from_memory(cert_pem, xmlsec.KeyFormat.CERT_PEM, None)
+            ctx = xmlsec.SignatureContext()
+            ctx.key = key
+            ctx.verify(sig_node)
+        except Exception as exc:
+            raise SSOError(
+                f"IdP metadata signature verification FAILED (url={source_url}): {exc}"
+            ) from exc
+        logger.info("[saml] IdP metadata signature verified (url=%s)", source_url)
 
     def _parse_idp_metadata(self, xml_bytes: bytes) -> dict:
         """解析 IdP metadata XML。
@@ -512,8 +620,8 @@ class SAMLHandler:
         (XSW防护).
 
         G-11 fix: uses defusedxml for XML parsing (audited library).
-        NOTE: xmlsec integration is not yet implemented; always uses self-verified
-        RSA-SHA256 regardless of _HAS_XMLSEC flag.
+        P1-6 fix: xmlsec 不可用时拒绝验证（fail-closed），不再回退到自研
+        RSA-SHA256 实现。自研实现存在 c14n/XSW 处理缺陷，不可用于生产 SSO。
 
         验证步骤：
           1. 解析证书为公钥对象
@@ -535,6 +643,15 @@ class SAMLHandler:
         Raises:
             SSOError: 任何验证失败（fail-closed）
         """
+        # P1-6 fix: xmlsec 不可用时拒绝 —— 不回退到自研签名验证。
+        # 自研实现存在 c14n 命名空间处理、XSW 防护等微妙缺陷，仅用 xmlsec
+        # 审计过的库验证 SAML 签名才能达到生产安全。
+        if not _HAS_XMLSEC:
+            raise SSOError(
+                "SAML signature verification REJECTED — xmlsec library not installed. "
+                "Install xmlsec (pip install xmlsec) for production SSO. "
+                "Refusing to accept SAML response with unverified signature."
+            )
         # 1. 解析证书 → 公钥
         try:
             cert_der = base64.b64decode(cert_b64)
@@ -837,12 +954,29 @@ class SAMLHandler:
             if isinstance(v, list) and v:
                 roles = [str(r) for r in v]
                 break
+        # P1-4 fix: 过滤高危角色，防止 IdP 注入 admin/superadmin 等高权角色
+        if roles:
+            filtered = [r for r in roles if r not in _DANGEROUS_ROLES]
+            if len(filtered) != len(roles):
+                dropped = sorted(set(roles) - set(filtered))
+                logger.warning(
+                    "[saml] Dropped dangerous roles from IdP attributes: %s", dropped
+                )
+            roles = filtered
         if not roles:
             roles = [self._config.default_role]
 
         tenant_id = first_value("tenant_id") or first_value("TenantId")
 
-        sub = name_id or "unknown"
+        # P1-3 fix: NameID 缺失即拒绝 —— 不降级为 "unknown"。
+        # 降级会让所有无 NameID 的响应映射到同一 external_id "saml:unknown"，
+        # 造成身份合并/可致账号接管。fail-closed：拒绝认证。
+        sub = name_id
+        if not sub:
+            raise SSOError(
+                "SAML response missing NameID — cannot establish identity. "
+                "Refusing to authenticate without a verified subject identifier."
+            )
         return SSOUser(
             external_id=f"saml:{sub}",
             email=email,
