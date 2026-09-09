@@ -57,12 +57,21 @@ DEFAULT_ATTRIBUTE_MAPPING: dict[str, Any] = {
 
 # P1-4 fix: 高危角色黑名单 —— IdP 返回的这些角色一律剔除，防止恶意/被攻陷 IdP
 # 注入高权角色直接接管系统。过滤后无角色则由调用方赋 default_role。
+# 扩展黑名单覆盖更多高危角色变体（administrator/manager/superuser/system 等），
+# 防止 IdP 通过变体名绕过过滤。与 saml_handler.py 的 _DANGEROUS_ROLES 保持一致。
 _DANGEROUS_ROLES: frozenset[str] = frozenset({
     "admin",
     "superadmin",
     "system:admin",
     "root",
     "sysadmin",
+    "administrator",
+    "superuser",
+    "system",
+    "manager",
+    "global_admin",
+    "tenant:admin",
+    "org:admin",
 })
 
 
@@ -163,6 +172,25 @@ class SSOManager:
         # 防护依赖 handler 实例内的 pending/consumed 状态——若每次回调新建
         # handler 则状态表恒空、防护全部失效（v5.2.0 前为死代码，P0 修复）。
         self._saml_handler: Any | None = None
+        # state CSRF 校验（纵深防御）：get_authorize_url(store_state=True) 时
+        # 将 state 存入 _pending_states（带时间戳），handle_callback 校验并
+        # 一次性消费。TTL 到期自动清理。若调用方自己管理 state（如
+        # SSOProviderRegistry），可传 store_state=False 跳过本层存储，由调用
+        # 方负责校验（向后兼容）。
+        self._pending_states: dict[str, float] = {}
+        self._pending_states_ttl: float = 600.0  # state 有效窗口（秒）
+
+    def _cleanup_pending_states(self) -> None:
+        """清理过期的 pending state（防 _pending_states 无界增长）。
+
+        类似 saml_handler.py 的 _pending_request_ids TTL 清理逻辑。
+        """
+        if not self._pending_states:
+            return
+        cutoff = time.time() - self._pending_states_ttl
+        expired = [s for s, ts in self._pending_states.items() if ts < cutoff]
+        for s in expired:
+            self._pending_states.pop(s, None)
 
     def _get_saml_handler_instance(self):
         """获取（并缓存）进程内唯一的 SAMLHandler 实例。
@@ -184,6 +212,7 @@ class SSOManager:
         self,
         state: str = "",
         code_challenge: str = "",
+        store_state: bool = True,
     ) -> str:
         """构造 IdP authorize URL。
 
@@ -193,7 +222,19 @@ class SSOManager:
                 ``code_challenge_method=S256`` 与 ``code_challenge`` 参数。
                 由调用方通过 :func:`generate_pkce_pair` 生成并暂存
                 code_verifier（用于 ``handle_callback``）。
+            store_state: 是否将 state 存入本实例 ``_pending_states`` 供
+                ``handle_callback`` 校验（纵深防御 CSRF）。默认 True。
+                若调用方自己管理 state 校验（如 SSOProviderRegistry 已在
+                registry 层校验），可传 False 跳过本层存储避免冗余。
+                state 为空时不存储（调用方未使用 state 则不强制）。
         """
+        # state CSRF 校验：存储 state 供 handle_callback 校验（纵深防御）。
+        # 仅当 state 非空且 store_state=True 时存储；空 state 不存储
+        #（调用方未使用 state 则不强制 CSRF 防护，保持向后兼容）。
+        if state and store_state:
+            self._pending_states[state] = time.time()
+            self._cleanup_pending_states()
+
         # SAML：构造 AuthnRequest 重定向 URL（由 SAMLHandler 实现）。
         # 复用同一 handler 实例（重放防护状态跨调用保持）。
         if self._config.provider == SSOProvider.SAML:
@@ -265,6 +306,22 @@ class SSOManager:
                 "SSOConfig.token_url is required for OIDC handle_callback"
             )
 
+        # state CSRF 校验（纵深防御）：若本实例 _pending_states 非空，说明
+        # get_authorize_url(store_state=True) 存过 state，此处必须校验。
+        # - state 在 _pending_states 中 → 校验通过，一次性消费（单次使用）
+        # - state 不在但 _pending_states 非空 → CSRF/重放/过期，拒绝
+        # - _pending_states 为空 → 调用方自己管理 state（如 SSOProviderRegistry
+        #   已在 registry 层校验），跳过本层校验（向后兼容）
+        if state and self._pending_states:
+            if state not in self._pending_states:
+                raise SSOError(
+                    f"SSO state mismatch or expired: {state!r} — "
+                    "possible CSRF attack or expired state"
+                )
+            # 一次性消费（单次使用，防重放）
+            self._pending_states.pop(state, None)
+            self._cleanup_pending_states()
+
         token_resp = self._exchange_code(code, state, code_verifier)
         access_token = str(token_resp.get("access_token", ""))
         refresh_token = str(token_resp.get("refresh_token", ""))
@@ -281,9 +338,12 @@ class SSOManager:
         # P1-2 fix: 验证 id_token 签名（JWKS）—— fail-closed。
         # id_token 存在时必须验签，验签失败/JWKS 获取失败即拒绝登录。
         # id_token 缺失时继续依赖 userinfo（保持向后兼容，部分 provider 不返回 id_token）。
+        # 修复3: 保存验签后的 payload，优先用于身份信息（sub/email/name/roles），
+        # 因为 id_token 已验签（JWKS），比 userinfo（仅 TLS 保护）更可信。
         id_token = str(token_resp.get("id_token", ""))
+        id_token_payload: dict[str, Any] = {}
         if id_token:
-            self._verify_id_token(id_token)
+            id_token_payload = self._verify_id_token(id_token)
         else:
             logger.warning(
                 "[sso] OIDC token response missing id_token — relying on userinfo "
@@ -296,7 +356,12 @@ class SSOManager:
         if access_token and self._config.userinfo_url:
             user_claims = self._fetch_userinfo(access_token)
 
-        user = self._build_user_from_claims(user_claims, token_resp)
+        # 身份优先级：id_token（已验签）> userinfo（TLS 保护）。
+        # _build_user_from_claims 优先从 id_token_payload 取 sub/email/name/roles，
+        # userinfo 仅补充 id_token 中缺失的字段。
+        user = self._build_user_from_claims(
+            user_claims, token_resp, id_token_payload=id_token_payload
+        )
         session_id = f"sess_{secrets.token_hex(16)}_{int(now)}"
         session = SSOSession(
             session_id=session_id,
@@ -579,12 +644,20 @@ class SSOManager:
         )
 
     def _build_user_from_claims(
-        self, claims: dict[str, Any], token_resp: dict[str, Any]
+        self,
+        claims: dict[str, Any],
+        token_resp: dict[str, Any],
+        id_token_payload: dict[str, Any] | None = None,
     ) -> SSOUser:
         """Construct ``SSOUser`` from IdP claims + token response.
 
         支持外部属性映射（PRD 3.4）：当 ``SSOConfig.attribute_mapping`` 非空时，
         按映射从 claims 取值；否则使用默认 precedence（向后兼容）。
+
+        修复3: 身份优先级 —— id_token（已验签）> userinfo（TLS 保护）。
+        当 ``id_token_payload`` 非空时，优先从中提取 sub/email/name/roles，
+        userinfo（``claims``）仅补充 id_token 中缺失的字段。这防止被攻陷的
+        userinfo 端点篡改已由 id_token 确立的身份。
 
         Claim precedence (first non-empty wins, 默认无映射时):
           - external_id: ``sub`` | ``user_id``（缺失时抛 :class:`SSOError`
@@ -605,20 +678,30 @@ class SSOManager:
         now = time.time()
         mapping = self._config.attribute_mapping or {}
 
+        # 修复3: 合并身份 claims —— id_token_payload（已验签）优先，
+        # userinfo（claims）仅补充 id_token 中缺失的字段。
+        # 仅用 id_token 的非空值覆盖，避免空值抹掉 userinfo 的有效值。
+        idp = id_token_payload or {}
+        merged: dict[str, Any] = {}
+        merged.update(claims)
+        for k, v in idp.items():
+            if v is not None and v != "" and v != []:
+                merged[k] = v
+
         if mapping:
-            sub = self._claim_first(claims, mapping.get("external_id", "sub")) or ""
+            sub = self._claim_first(merged, mapping.get("external_id", "sub")) or ""
             # P0 fix: sub 缺失即拒绝 —— 不降级、不从未验签 id_token 截取
             if not sub:
                 raise SSOError(
                     "OIDC userinfo response missing subject identifier "
                     f"(claim '{mapping.get('external_id', 'sub')}') — login rejected"
                 )
-            email = self._claim_first(claims, mapping.get("email", "email"))
-            name = self._claim_first(claims, mapping.get("display_name", "name"))
-            roles = self._mapped_roles(claims, mapping)
+            email = self._claim_first(merged, mapping.get("email", "email"))
+            name = self._claim_first(merged, mapping.get("display_name", "name"))
+            roles = self._mapped_roles(merged, mapping)
             if not roles:
                 roles = [self._config.default_role]
-            tenant_id = self._claim_first(claims, mapping.get("tenant_id", "tid"))
+            tenant_id = self._claim_first(merged, mapping.get("tenant_id", "tid"))
             return SSOUser(
                 external_id=f"{self._config.provider.value}:{sub}",
                 email=str(email or ""),
@@ -631,8 +714,8 @@ class SSOManager:
 
         # 默认 precedence（向后兼容）
         sub = (
-            claims.get("sub")
-            or claims.get("user_id")
+            merged.get("sub")
+            or merged.get("user_id")
             or ""
         )
         # P0 fix: sub 缺失即拒绝（不降级 "unknown"，见上方 docstring）
@@ -641,19 +724,19 @@ class SSOManager:
                 "OIDC userinfo response missing 'sub' claim — login rejected"
             )
 
-        email = str(claims.get("email", "") or "")
+        email = str(merged.get("email", "") or "")
         name = (
-            claims.get("name")
-            or claims.get("preferred_username")
-            or claims.get("nickname")
+            merged.get("name")
+            or merged.get("preferred_username")
+            or merged.get("nickname")
             or ""
         )
-        roles = self._roles_from_claims(claims)
+        roles = self._roles_from_claims(merged)
         if not roles:
             roles = [self._config.default_role]
         tenant_id = (
-            claims.get("tenant_id")
-            or claims.get("tid")
+            merged.get("tenant_id")
+            or merged.get("tid")
             or ""
         )
         return SSOUser(
@@ -701,8 +784,8 @@ class SSOManager:
             mapped = raw
         else:
             mapped = [role_map.get(r, r) for r in raw]
-        # P1-4 fix: 过滤高危角色
-        filtered = [r for r in mapped if r not in _DANGEROUS_ROLES]
+        # P1-4 fix: 过滤高危角色（大小写不敏感比较，防止 IdP 用 "Admin"/"ADMIN" 绕过）
+        filtered = [r for r in mapped if r.lower() not in _DANGEROUS_ROLES]
         if len(filtered) != len(mapped):
             dropped = sorted(set(mapped) - set(filtered))
             logger.warning(
@@ -718,6 +801,7 @@ class SSOManager:
         the default role).
 
         P1-4 fix: 剔除高危角色（admin/superadmin 等），防止 IdP 注入高权角色。
+        大小写不敏感比较，防止 IdP 用 "Admin"/"ADMIN" 等变体绕过过滤。
         """
         raw: list[str] = []
         for key in ("roles", "role", "groups"):
@@ -728,8 +812,8 @@ class SSOManager:
             if isinstance(v, str) and v.strip():
                 raw = [v.strip()]
                 break
-        # P1-4 fix: 过滤高危角色
-        filtered = [r for r in raw if r not in _DANGEROUS_ROLES]
+        # P1-4 fix: 过滤高危角色（大小写不敏感比较）
+        filtered = [r for r in raw if r.lower() not in _DANGEROUS_ROLES]
         if len(filtered) != len(raw):
             dropped = sorted(set(raw) - set(filtered))
             logger.warning(

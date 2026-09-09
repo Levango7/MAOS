@@ -302,7 +302,33 @@ class RBACManager:
                     role.value, user_id, tenant_id, granted_by, expires_at)
         return grant
 
-    def revoke_role(self, user_id: str, role: Role, tenant_id: str = "") -> bool:
+    def revoke_role(
+        self,
+        user_id: str,
+        role: Role,
+        tenant_id: str = "",
+        *,
+        _caller_roles: frozenset[Role] | None = None,
+    ) -> bool:
+        """Revoke a role from a user.
+
+        P1-7 fix: 提权防护 — 撤销 ADMIN/SUPERADMIN 角色时，调用者必须拥有
+        SUPERADMIN 角色（与 :meth:`grant_role` 对齐）。通过 ``_caller_roles``
+        传入调用方角色集合。未传入或不含 SUPERADMIN 时拒绝撤销高权限角色
+        （fail-closed），防止恶意撤销 ADMIN 角色导致 DoS（管理员权限被
+        剥夺后无法恢复）。
+
+        C8 note: authorization is enforced at the HTTP layer
+        (dashboard/routers/rbac.py require_admin). Callers invoking this
+        method directly MUST perform their own authorization check.
+        """
+        # P1-7 fix: 提权防护 — 撤销 ADMIN/SUPERADMIN 必须由 SUPERADMIN 执行
+        if role in (Role.ADMIN, Role.SUPERADMIN):
+            if _caller_roles is None or Role.SUPERADMIN not in _caller_roles:
+                raise PermissionError(
+                    f"Cannot revoke {role.value} role: caller lacks SUPERADMIN privilege. "
+                    "Only SUPERADMIN can revoke ADMIN or SUPERADMIN roles."
+                )
         before = len(self._grants)
         self._grants = [
             g for g in self._grants

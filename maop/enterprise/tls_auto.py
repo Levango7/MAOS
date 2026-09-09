@@ -161,8 +161,12 @@ def _cert_key_pair_matches(cert_file: str, key_file: str) -> bool:
         from cryptography.hazmat.primitives import serialization
         from cryptography.x509 import load_pem_x509_certificate
 
-        cert_pem = open(cert_file, "rb").read()  # noqa: SIM115
-        key_pem = open(key_file, "rb").read()  # noqa: SIM115
+        # 修复: 使用 context manager 确保文件句柄及时关闭，避免在非
+        # refcount GC 的 Python 实现上文件句柄泄漏。
+        with open(cert_file, "rb") as f:
+            cert_pem = f.read()
+        with open(key_file, "rb") as f:
+            key_pem = f.read()
         cert = load_pem_x509_certificate(cert_pem)
         private_key = serialization.load_pem_private_key(key_pem, password=None)
         cert_pub = cert.public_key().public_bytes(

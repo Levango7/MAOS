@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -297,7 +298,9 @@ class LicenseValidator:
             return
         expected_fp = os.getenv("MAOP_LICENSE_KEY_FP", "").strip() or _DEFAULT_PUBLIC_KEY_FINGERPRINT
         actual_fp = hashlib.sha256(key_data).hexdigest()
-        if actual_fp != expected_fp:
+        # 修复: 使用常量时间比较防止时序攻击（攻击者可通过比较耗时
+        # 逐字节推测指纹，虽然 SHA-256 指纹场景风险低，但遵循安全最佳实践）。
+        if not hmac.compare_digest(actual_fp, expected_fp):
             raise LicenseError(
                 f"License public key fingerprint mismatch — refusing to load. "
                 f"Expected {expected_fp[:16]}..., got {actual_fp[:16]}... "
@@ -387,7 +390,8 @@ class LicenseValidator:
         if not info.fingerprint:
             return
         actual = expected_fingerprint or compute_machine_fingerprint()
-        if actual != info.fingerprint:
+        # 修复: 使用常量时间比较防止时序攻击，与公钥指纹校验保持一致。
+        if not hmac.compare_digest(actual, info.fingerprint):
             raise LicenseFingerprintError(
                 f"License for '{info.customer}' is bound to machine fingerprint "
                 f"{info.fingerprint[:12]}… but this machine presents {actual[:12]}… "

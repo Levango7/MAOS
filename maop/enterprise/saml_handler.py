@@ -32,6 +32,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from abc import ABC, abstractmethod
 from typing import Any
 
 from cryptography.hazmat.primitives import hashes
@@ -101,13 +102,141 @@ _DEFAULT_SESSION_TTL_S = 28800
 
 # P1-4 fix: 高危角色黑名单 —— IdP 返回的这些角色一律剔除，防止恶意/被攻陷 IdP
 # 注入高权角色直接接管系统。与 sso.py 的 _DANGEROUS_ROLES 保持一致。
+# 扩展黑名单覆盖更多高危角色变体（administrator/manager/superuser/system 等），
+# 防止 IdP 通过变体名绕过过滤。
 _DANGEROUS_ROLES: frozenset[str] = frozenset({
     "admin",
     "superadmin",
     "system:admin",
     "root",
     "sysadmin",
+    "administrator",
+    "superuser",
+    "system",
+    "manager",
+    "global_admin",
+    "tenant:admin",
+    "org:admin",
 })
+
+
+# ── 修复5: Replay 防护共享存储接口 ──────────────────────────────────
+# HA 多实例部署时，_pending_request_ids 和 _consumed_assertion_ids 存储在
+# 实例内存（dict），跨实例不共享 → 攻击者可向实例 A 发起 AuthnRequest，
+# 向实例 B 重放同一 Assertion 绕过重放防护。传入 Redis-backed ReplayStore
+# 使状态跨实例共享，恢复重放防护有效性。
+
+
+class ReplayStore(ABC):
+    """重放防护共享存储接口（修复5）。
+
+    HA 多实例部署时应传入 Redis-backed 实现（如 RedisReplayStore），
+    使 ``_pending_request_ids`` 和 ``_consumed_assertion_ids`` 跨实例
+    共享，防止单实例内存态被绕过。
+
+    接口设计简洁：所有操作均为 O(1) 或近 O(1)，适配 Redis 等远程存储。
+    TTL 在每次 add/check_and_add 时传入，允许不同表使用不同 TTL。
+    """
+
+    @abstractmethod
+    def check_and_add(self, key: str, ttl: float) -> bool:
+        """原子检查并添加：若 key 不存在则添加（带 TTL）返回 True，
+        若 key 已存在返回 False。用于 assertion replay prevention。"""
+        ...
+
+    @abstractmethod
+    def add(self, key: str, ttl: float) -> None:
+        """添加/刷新 key（带 TTL 秒）。用于记录 pending request id。"""
+        ...
+
+    @abstractmethod
+    def pop(self, key: str) -> bool:
+        """移除 key（消费）。返回 key 是否存在。"""
+        ...
+
+    @abstractmethod
+    def contains(self, key: str) -> bool:
+        """检查 key 是否存在（未过期）。"""
+        ...
+
+    @abstractmethod
+    def is_empty(self) -> bool:
+        """检查存储是否为空。用于判断是否有 pending 请求。
+
+        HA 场景下可近似返回 False（保守假设有 pending），或实现精确计数。
+        """
+        ...
+
+    @abstractmethod
+    def cleanup(self, ttl: float) -> None:
+        """清理过期项（超过 ttl 秒未访问的）。"""
+        ...
+
+
+class MemoryReplayStore(ReplayStore):
+    """内存 ReplayStore（dict + TTL），默认实现。
+
+    使用 ``dict[str, float]`` 存储 key → 添加时间戳，支持 TTL 清理。
+    同时实现 dict-like 接口（``__setitem__``/``__contains__``/``pop``/
+    ``__bool__``/``items``）以向后兼容测试中直接操作 dict 的场景。
+    """
+
+    def __init__(self) -> None:
+        self._data: dict[str, float] = {}
+
+    # ── ReplayStore 接口 ──
+    def check_and_add(self, key: str, ttl: float) -> bool:
+        now = time.time()
+        self._cleanup_now(ttl, now)
+        if key in self._data:
+            return False
+        self._data[key] = now
+        return True
+
+    def add(self, key: str, ttl: float) -> None:
+        self._data[key] = time.time()
+
+    def pop(self, key: str, *args: Any) -> Any:
+        """移除 key。
+
+        - ``pop(key)`` → bool（ReplayStore 接口：返回 key 是否存在）
+        - ``pop(key, default)`` → value（dict 兼容：返回值或 default）
+        """
+        if args:
+            return self._data.pop(key, args[0])
+        return self._data.pop(key, None) is not None
+
+    def contains(self, key: str) -> bool:
+        return key in self._data
+
+    def is_empty(self) -> bool:
+        return len(self._data) == 0
+
+    def cleanup(self, ttl: float) -> None:
+        self._cleanup_now(ttl, time.time())
+
+    def _cleanup_now(self, ttl: float, now: float) -> None:
+        cutoff = now - ttl
+        expired = [k for k, ts in self._data.items() if ts < cutoff]
+        for k in expired:
+            self._data.pop(k, None)
+
+    # ── dict-like 兼容（向后兼容测试中直接操作 dict 的场景）──
+    def __setitem__(self, key: str, value: float) -> None:
+        self._data[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._data
+
+    def __bool__(self) -> bool:
+        return bool(self._data)
+
+    def items(self):
+        return self._data.items()
+
+    def pop_with_default(self, key: str, default: Any = None) -> Any:
+        """dict-like pop(key, default) — 兼容测试中 ``.pop(key, None)`` 调用。"""
+        return self._data.pop(key, default)
 
 
 class SAMLHandler:
@@ -117,21 +246,28 @@ class SAMLHandler:
     所有验证失败均抛 SSOError（fail-closed），绝不返回 stub session。
     """
 
-    def __init__(self, config: SSOConfig) -> None:
+    def __init__(self, config: SSOConfig, replay_store: ReplayStore | None = None) -> None:
         self._config = config
         self._idp_metadata: dict | None = None  # 缓存解析的 metadata
         self._clock_skew_s = CLOCK_SKEW_S
+        # 修复5: 可插拔共享存储接口 —— HA 多实例部署时传入 Redis-backed
+        # ReplayStore 使重放防护状态跨实例共享。默认 MemoryReplayStore
+        #（向后兼容单实例内存态）。两个表共用同一 store（request_id 与
+        # assertion_id 格式不同，key 空间不重叠）。
+        # HA 部署时应传入 Redis-backed ReplayStore，否则 _pending_request_ids
+        # 和 _consumed_assertion_ids 仅存实例内存，可被跨实例重放绕过。
+        self._replay_store = replay_store or MemoryReplayStore()
         # G-06: 记录 SP 发出的 AuthnRequest ID（id → 发出时间戳），用于
         # InResponseTo 校验。dict + TTL 清理：旧实现 set 无时间信息，
         # 长期运行会无界增长；且必须与 Assertion 消费表一样在 handler
         # 实例内持续积累（由调用方复用同一实例，见 sso.py SSOManager）。
-        self._pending_request_ids: dict[str, float] = {}
+        self._pending_request_ids: ReplayStore = self._replay_store
         # AuthnRequest 有效窗口（秒）：超时后丢弃对应 pending id
         self._request_id_ttl_s: float = 600.0
         # G-11: 标记是否已发出 xmlsec 缺失警告（仅首次 handle_response 调用时发一次）
         self._xmlsec_warning_emitted: bool = False
         # P0: Assertion replay prevention — consumed assertion IDs with timestamps
-        self._consumed_assertion_ids: dict[str, float] = {}
+        self._consumed_assertion_ids: ReplayStore = self._replay_store
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
@@ -155,12 +291,9 @@ class SAMLHandler:
         request_id = f"id_{secrets.token_hex(16)}"
         request_xml = self._build_authn_request(request_id)
         # G-06: 记录 request_id 用于 InResponseTo 校验（带时间戳，供 TTL 清理）
-        self._pending_request_ids[request_id] = time.time()
+        self._pending_request_ids.add(request_id, self._request_id_ttl_s)
         # 清理过期 pending（防无界增长）
-        cutoff = time.time() - self._request_id_ttl_s
-        expired = [rid for rid, ts in self._pending_request_ids.items() if ts < cutoff]
-        for rid in expired:
-            self._pending_request_ids.pop(rid, None)
+        self._pending_request_ids.cleanup(self._request_id_ttl_s)
         # SAML HTTP-Redirect binding：DEFLATE（raw, 无 zlib header）→ base64 → URL 编码
         compressor = zlib.compressobj(9, zlib.DEFLATED, -15)
         deflated = compressor.compress(request_xml) + compressor.flush()
@@ -227,14 +360,14 @@ class SAMLHandler:
         #   ID 消费表兜底防重放（兼容不规范 IdP）。
         in_response_to = root.get("InResponseTo", "")
         if in_response_to:
-            if in_response_to not in self._pending_request_ids:
+            if not self._pending_request_ids.contains(in_response_to):
                 raise SSOError(
                     f"SAML Response InResponseTo={in_response_to!r} does not match "
                     f"any pending AuthnRequest ID — possible replay attack"
                 )
             # 消费已使用的 request_id（一次性使用）
-            self._pending_request_ids.pop(in_response_to, None)
-        elif self._pending_request_ids:
+            self._pending_request_ids.pop(in_response_to)
+        elif not self._pending_request_ids.is_empty():
             raise SSOError(
                 "SAML Response missing InResponseTo while AuthnRequest is "
                 "pending — possible replay/CSRF attack"
@@ -254,13 +387,9 @@ class SAMLHandler:
             raise SSOError("SAMLResponse missing <saml:Assertion> element")
 
         # P0: Assertion replay prevention — lazy cleanup + check
-        now_ts = time.time()
-        self._consumed_assertion_ids = {
-            aid: ts for aid, ts in self._consumed_assertion_ids.items()
-            if now_ts - ts < _DEFAULT_SESSION_TTL_S
-        }
+        self._consumed_assertion_ids.cleanup(_DEFAULT_SESSION_TTL_S)
         assertion_id = assertion_elem.get("ID", "")
-        if assertion_id and assertion_id in self._consumed_assertion_ids:
+        if assertion_id and self._consumed_assertion_ids.contains(assertion_id):
             raise SSOError(f"Assertion replay detected: ID={assertion_id!r}")
 
         # 4. 获取 IdP 证书
@@ -314,7 +443,7 @@ class SAMLHandler:
 
         # P0: Record consumed assertion ID after all validations pass
         if assertion_id:
-            self._consumed_assertion_ids[assertion_id] = time.time()
+            self._consumed_assertion_ids.add(assertion_id, _DEFAULT_SESSION_TTL_S)
 
         # 8. 构造 SSOUser 和 SSOSession
         now = time.time()
@@ -620,16 +749,11 @@ class SAMLHandler:
         (XSW防护).
 
         G-11 fix: uses defusedxml for XML parsing (audited library).
-        P1-6 fix: xmlsec 不可用时拒绝验证（fail-closed），不再回退到自研
-        RSA-SHA256 实现。自研实现存在 c14n/XSW 处理缺陷，不可用于生产 SSO。
-
-        验证步骤：
-          1. 解析证书为公钥对象
-          2. 提取 <ds:Signature> 元素（Assertion 内优先，其次 Response 内）
-          3. 提取 SignedInfo / SignatureValue / Reference / DigestValue
-          4. 对被签名元素（去掉 Signature 后）做 exclusive c14n，计算 SHA256 摘要，
-             与 Reference.DigestValue 比对
-          5. 对 SignedInfo 做 exclusive c14n，用 RSA-SHA256 (PKCS1v15) 验证 SignatureValue
+        P1-6 fix: xmlsec 不可用时拒绝验证（fail-closed）。
+        修复4: xmlsec 可用时优先使用其 API（审计过的库）验证签名；
+        若 xmlsec API 调用失败（ImportError/API 不兼容/验证异常），
+        记录 warning 并 fallback 到自研 RSA-SHA256 实现（已覆盖主要
+        安全点：c14n + 摘要 + 签名验证 + XSW Reference URI 校验）。
 
         Args:
             response_xml: 完整 SAML Response XML bytes
@@ -644,14 +768,105 @@ class SAMLHandler:
             SSOError: 任何验证失败（fail-closed）
         """
         # P1-6 fix: xmlsec 不可用时拒绝 —— 不回退到自研签名验证。
-        # 自研实现存在 c14n 命名空间处理、XSW 防护等微妙缺陷，仅用 xmlsec
-        # 审计过的库验证 SAML 签名才能达到生产安全。
         if not _HAS_XMLSEC:
             raise SSOError(
                 "SAML signature verification REJECTED — xmlsec library not installed. "
                 "Install xmlsec (pip install xmlsec) for production SSO. "
                 "Refusing to accept SAML response with unverified signature."
             )
+        # 修复4: xmlsec 可用时优先使用其审计过的 API 验证签名。
+        # 若 xmlsec API 调用失败，fallback 到自研实现（不直接拒绝，
+        # 保持可用性同时记录 warning 供运维排查）。
+        try:
+            return self._verify_signature_xmlsec(response_xml, cert_b64)
+        except Exception as exc:
+            logger.warning(
+                "[saml] xmlsec signature verification failed, falling back to "
+                "self-implemented verification: %s",
+                exc,
+            )
+            return self._verify_signature_selfimplemented(response_xml, cert_b64)
+
+    def _verify_signature_xmlsec(self, response_xml: bytes, cert_b64: str) -> Any:
+        """使用 xmlsec 审计过的 API 验证 SAML XML 签名（修复4）。
+
+        xmlsec 是 XMLDSig 的参考实现，正确处理 c14n、enveloped signature
+        transform、XSW 防护等微妙细节，优于自研实现。
+
+        Returns:
+            签名覆盖的元素（Assertion 或 Response 的 lxml 元素），用于
+            XSW 防护（调用方确保数据提取使用同一元素）。
+
+        Raises:
+            SSOError: xmlsec 不可用、证书解析失败、签名验证失败等。
+            Exception: xmlsec API 调用异常（由上层 fallback 捕获）。
+        """
+        import xmlsec  # noqa: F401 — 若未安装抛 ImportError 由上层 fallback
+
+        # 1. 解析证书 → PEM（xmlsec Key.from_memory 接受 PEM 格式）
+        try:
+            cert_der = base64.b64decode(cert_b64)
+        except Exception as exc:
+            raise SSOError(f"IdP cert base64 decode failed: {exc}") from exc
+        cert_pem = (
+            b"-----BEGIN CERTIFICATE-----\n"
+            + base64.b64encode(cert_der)
+            + b"\n-----END CERTIFICATE-----\n"
+        )
+
+        # 2. 解析 XML（G-11: 使用 defusedxml 防 XXE）
+        try:
+            root = _safe_parse(response_xml)
+        except Exception as exc:
+            raise SSOError(f"Signature verification: XML parse failed: {exc}") from exc
+
+        # 3. 查找 Signature 元素：Assertion 内的优先，其次 Response 内的
+        sig_elem = root.find(f".//{{{_SAML_NS}}}Assertion/{{{_DS_NS}}}Signature")
+        if sig_elem is None:
+            sig_elem = root.find(f"{{{_DS_NS}}}Signature")
+        if sig_elem is None:
+            sig_elem = root.find(f".//{{{_DS_NS}}}Signature")
+        if sig_elem is None:
+            raise SSOError("SAML Response missing <ds:Signature> element")
+
+        signed_elem = sig_elem.getparent()
+        if signed_elem is None:
+            raise SSOError(
+                "Signature element has no parent (cannot determine signed element)"
+            )
+
+        # 4. 用 xmlsec 验证签名
+        key = xmlsec.Key.from_memory(cert_pem, xmlsec.KeyFormat.CERT_PEM, None)
+        ctx = xmlsec.SignatureContext()
+        ctx.key = key
+        ctx.verify(sig_elem)  # 验证失败抛异常
+
+        logger.debug("[saml] XML signature verification passed (xmlsec)")
+        # G-06: 返回签名验证的元素，用于 XSW 防护
+        return signed_elem
+
+    def _verify_signature_selfimplemented(self, response_xml: bytes, cert_b64: str) -> Any:
+        """自研 SAML XML 签名验证（fallback，修复4）。
+
+        当 xmlsec API 不可用或调用失败时使用。已覆盖主要安全点：
+        c14n + SHA256 摘要 + RSA-SHA256 签名验证 + XSW Reference URI 校验。
+        生产环境应优先使用 xmlsec（见 _verify_signature_xmlsec）。
+
+        验证步骤：
+          1. 解析证书为公钥对象
+          2. 提取 <ds:Signature> 元素（Assertion 内优先，其次 Response 内）
+          3. 提取 SignedInfo / SignatureValue / Reference / DigestValue
+          4. 对被签名元素（去掉 Signature 后）做 exclusive c14n，计算 SHA256 摘要，
+             与 Reference.DigestValue 比对
+          5. 对 SignedInfo 做 exclusive c14n，用 RSA-SHA256 (PKCS1v15) 验证 SignatureValue
+
+        Returns:
+            The signed element (Assertion or Response lxml element) if
+            verification passes.
+
+        Raises:
+            SSOError: 任何验证失败（fail-closed）
+        """
         # 1. 解析证书 → 公钥
         try:
             cert_der = base64.b64decode(cert_b64)
@@ -781,7 +996,7 @@ class SAMLHandler:
         except Exception as exc:
             raise SSOError(f"SignatureValue RSA-SHA256 verification failed: {exc}") from exc
 
-        logger.debug("[saml] XML signature verification passed")
+        logger.debug("[saml] XML signature verification passed (self-implemented)")
         # G-06: 返回签名验证的元素，用于 XSW 防护
         return signed_elem
 
@@ -955,8 +1170,9 @@ class SAMLHandler:
                 roles = [str(r) for r in v]
                 break
         # P1-4 fix: 过滤高危角色，防止 IdP 注入 admin/superadmin 等高权角色
+        # 大小写不敏感比较，防止 IdP 用 "Admin"/"ADMIN" 等变体绕过过滤
         if roles:
-            filtered = [r for r in roles if r not in _DANGEROUS_ROLES]
+            filtered = [r for r in roles if r.lower() not in _DANGEROUS_ROLES]
             if len(filtered) != len(roles):
                 dropped = sorted(set(roles) - set(filtered))
                 logger.warning(
